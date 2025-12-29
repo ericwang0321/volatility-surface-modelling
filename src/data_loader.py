@@ -121,8 +121,9 @@ class DataLoader:
 
         # 4. Filter Liquid Contracts
         # Strict rule: Volume must be > 0. This removes stale quotes.
-        df = df[df['volume'] > 0]
-
+        df = df[(df['volume'] > 0) | (df['openInterest'] > 0)].copy()
+        df = df[(df['bid'] > 0.05) & (df['ask'] > 0.05)]
+        df = df[df['impliedVolatility'] > 0.01]
         # 5. Calculate Moneyness (Strike / Spot)
         # S = Spot, K = Strike
         df['S'] = self.spot_price
