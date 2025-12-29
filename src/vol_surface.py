@@ -1,7 +1,6 @@
 import numpy as np
 import pandas as pd
 import logging
-from scipy.interpolate import interp1d
 from typing import Dict, Tuple
 
 from src.svi_model import SVIModel
@@ -12,58 +11,40 @@ logger = logging.getLogger(__name__)
 
 class VolatilitySurface:
     """
-    Constructs the Volatility Surface by calibrating SVI slices 
-    for each expiration and interpolating in time.
+    Constructs the Volatility Surface and extracts Local Volatility using Dupire's Formula.
     """
 
     def __init__(self, ticker: str = "SPY"):
         self.ticker = ticker
         self.data_loader = DataLoader(ticker)
-        self.svi_params = {} # Stores {expiration_date: svi_params_dict}
+        self.svi_params = {} # {expiration_time: svi_params_dict}
         self.spot_price = None
         self.raw_data = None
         
-        # Grid settings for the surface
-        self.moneyness_grid = np.linspace(0.8, 1.2, 50) # 80% to 120% moneyness
-        self.time_grid = None # Will be set dynamically
+        self.moneyness_grid = np.linspace(0.8, 1.2, 50)
+        self.time_grid = None 
 
     def build(self):
         """
-        Main pipeline: Fetches data, calibrates SVI for each slice, 
-        and prepares the surface.
+        Main pipeline: Fetches data, calibrates SVI for each slice.
         """
-        # 1. Fetch Data
         self.raw_data = self.data_loader.fetch_options_chain()
         self.spot_price = self.data_loader.spot_price
         
-        # 2. Get unique expirations and sort them
         expirations = sorted(self.raw_data['expirationDate'].unique())
         self.time_grid = []
 
         logger.info(f"Building Vol Surface for {self.ticker} across {len(expirations)} expiries.")
 
-        # 3. Calibrate SVI for each slice
         for exp in expirations:
-            # Filter data for this expiry
             df_slice = self.raw_data[self.raw_data['expirationDate'] == exp]
-            
-            # We need at least 5 points to calibrate 5 SVI params
-            if len(df_slice) < 5:
-                continue
+            if len(df_slice) < 5: continue
 
             T = df_slice['T'].iloc[0]
-            
-            # Prepare arrays for calibration
-            # k = log(K/S) -> .values ensures it's a numpy array
             k_data = np.log(df_slice['moneyness']).values
-            
-            # w = Total Variance = sigma^2 * T
-            # impliedVolatility is a Series, so we convert result to numpy array
             w_data = ((df_slice['impliedVolatility'] ** 2) * T).values
             
-            # Calibrate
             svi = SVIModel()
-            # FIX: Removed .values here because k_data/w_data are already arrays
             params = svi.calibrate(k_data, w_data)
             
             if params and params['success']:
@@ -72,84 +53,149 @@ class VolatilitySurface:
             else:
                 logger.warning(f"Calibration failed for expiry T={T:.4f}")
 
-        logger.info(f"Surface built successfully. Calibrated {len(self.svi_params)} slices.")
+        logger.info(f"Surface built. Calibrated {len(self.svi_params)} slices.")
 
     def get_implied_vol(self, k: float, T: float) -> float:
         """
-        Returns Implied Volatility for arbitrary (k, T).
-        Performs linear interpolation on Total Variance in Time dimension.
+        Returns Implied Volatility for log-moneyness k and time T.
+        Interpolates Total Variance linearly in time.
         """
         if not self.svi_params:
-            raise ValueError("Surface not built. Call build() first.")
+            raise ValueError("Surface not built.")
             
-        # 1. Find the two surrounding time slices (T_prev, T_next)
         sorted_times = sorted(self.svi_params.keys())
-        
-        # Extrapolation protection: Clamp T to min/max range
         T = max(sorted_times[0], min(T, sorted_times[-1]))
         
-        # If exact match
         if T in self.svi_params:
             return self._get_slice_vol(k, T)
 
-        # 2. Linear Interpolation in Total Variance Space
-        # Locate T in the sorted list
+        # Linear Interpolation of Total Variance (w)
         idx = np.searchsorted(sorted_times, T)
         t_lower = sorted_times[idx - 1]
         t_upper = sorted_times[idx]
         
-        # Calculate Total Variance (w) for lower and upper slices
         w_lower = (self._get_slice_vol(k, t_lower) ** 2) * t_lower
         w_upper = (self._get_slice_vol(k, t_upper) ** 2) * t_upper
         
-        # Linear Interpolation formula
         ratio = (T - t_lower) / (t_upper - t_lower)
         w_target = w_lower + ratio * (w_upper - w_lower)
         
-        # Convert back to Vol
+        if w_target < 0: return 0.01
         return np.sqrt(w_target / T)
 
     def _get_slice_vol(self, k: float, T: float) -> float:
-        """Helper to get vol from a specific known SVI slice"""
         params = self.svi_params[T]
         svi = SVIModel()
         svi.params = [params['a'], params['b'], params['rho'], params['m'], params['sigma']]
         return svi.get_vol(k, T)
 
-    def get_mesh_grid(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def get_local_vol(self, S_t: float, t: float) -> float:
         """
-        Generates 3D coordinates (X, Y, Z) for plotting.
-        X: Log-Moneyness
-        Y: Time to Maturity
-        Z: Implied Volatility
+        Calculates Local Volatility using Dupire's Formula via Finite Differences.
+        
+        Args:
+            S_t: Current asset price
+            t: Current time to maturity
+            
+        Returns:
+            Local Volatility (sigma_loc)
+        """
+        if not self.svi_params:
+            raise ValueError("Surface not built.")
+
+        # 1. Convert Spot to Log-Moneyness k = ln(K/S_0)
+        # Note: In Dupire, we usually fix Strike K and vary T. 
+        # Here we approximate: k corresponds to the log-moneyness of the strike relative to current spot.
+        # Let's use the standard representation: w(k, t) where k = log(K/Spot)
+        
+        # We need derivatives at (k, t). Let's assume K = S_t (ATM) for the path simulation,
+        # but technically Dupire uses K.
+        # k = ln(K / S_0).
+        # For the pricer, we need sigma_loc(S_t, t). 
+        # Relation: k = ln(S_t / S_0) (if we view it as spot evolution)
+        
+        k = np.log(S_t / self.spot_price)
+        
+        # Small perturbations for Finite Difference
+        dt = 0.001
+        dk = 0.01
+
+        # 2. Get Total Variance w(k, t)
+        # w = sigma_imp^2 * t
+        def get_w(k_val, t_val):
+            # Clamp t to avoid looking up T<0
+            if t_val < 1e-4: t_val = 1e-4
+            vol = self.get_implied_vol(k_val, t_val)
+            return (vol ** 2) * t_val
+
+        w = get_w(k, t)
+
+        # 3. Calculate Derivatives (Central Difference)
+        # dw/dt (Time slope)
+        dw_dt = (get_w(k, t + dt) - get_w(k, t - dt)) / (2 * dt)
+        
+        # dw/dk (Strike slope)
+        dw_dk = (get_w(k + dk, t) - get_w(k - dk, t)) / (2 * dk)
+        
+        # d2w/dk2 (Strike curvature)
+        d2w_dk2 = (get_w(k + dk, t) - 2*w + get_w(k - dk, t)) / (dk ** 2)
+
+        # 4. Dupire Formula
+        # numerator = dw/dt
+        # denominator = 1 - (k/w)*dw/dk + 0.25*(-0.25 - 1/w + (k/w)^2)*(dw/dk)^2 + 0.5*d2w/dk2
+        
+        # Safety checks to avoid division by zero
+        if w < 1e-6: w = 1e-6
+        
+        term1 = 1 - (k / w) * dw_dk
+        term2 = 0.25 * (-0.25 - (1/w) + (k/w)**2) * (dw_dk**2)
+        term3 = 0.5 * d2w_dk2
+        
+        denominator = term1 + term2 + term3
+        
+        # Sanity check for negative variance (Arbitrage violation)
+        if denominator < 1e-6 or dw_dt < 0:
+            # Fallback to Implied Vol if Dupire fails locally
+            return np.sqrt(w / t) if t > 0 else 0.0
+            
+        var_loc = dw_dt / denominator
+        
+        if var_loc < 0: 
+            return np.sqrt(w / t) # Fallback
+            
+        return np.sqrt(var_loc)
+
+    def get_mesh_grid(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Generates 3D coordinates for BOTH Implied and Local Volatility.
+        Returns: X, Y, Z_implied, Z_local
         """
         if not self.time_grid:
             self.build()
             
-        # Create a dense grid
-        # Use only valid calibrated times
         valid_times = sorted(self.svi_params.keys())
+        # Filter times to avoid T=0 issues
+        valid_times = [t for t in valid_times if t > 0.05]
         
         X, Y = np.meshgrid(self.moneyness_grid, valid_times)
-        Z = np.zeros_like(X)
+        Z_imp = np.zeros_like(X)
+        Z_loc = np.zeros_like(X)
         
         for i, t in enumerate(valid_times):
             for j, m_val in enumerate(self.moneyness_grid):
-                # moneyness_grid is K/S, but model takes log(K/S)
                 k = np.log(m_val)
-                Z[i, j] = self.get_implied_vol(k, t)
+                # Spot price implied by moneyness: S = S0 * exp(-k) ?? 
+                # Actually simpler: moneyness = K/S0 -> K = m_val * S0
+                # Dupire takes S_t. If we are plotting surface over Moneyness K/S0,
+                # we calculate Local Vol assuming the Spot moves to that Strike level.
+                S_equivalent = self.spot_price * m_val
                 
-        return X, Y, Z
+                Z_imp[i, j] = self.get_implied_vol(k, t)
+                Z_loc[i, j] = self.get_local_vol(S_equivalent, t)
+                
+        return X, Y, Z_imp, Z_loc
 
 # --- Test Block ---
 if __name__ == "__main__":
     surface = VolatilitySurface("SPY")
     surface.build()
-    
-    # Test a specific point (ATM option, 1 year out)
-    vol = surface.get_implied_vol(k=0, T=1.0)
-    print(f"\nEstimated ATM Volatility at T=1.0: {vol:.2%}")
-    
-    # Check surface dimensions
-    X, Y, Z = surface.get_mesh_grid()
-    print(f"Mesh Grid Generated. Shape: {Z.shape}")
