@@ -1,4 +1,4 @@
- Volatility Surface Modelling & Pricing Engine
+# Volatility Surface Modelling & Pricing Engine
 
 ## 📖 Project Overview
 
@@ -61,6 +61,7 @@ volatility-surface-modelling/
 ├── notebooks/              # Research & Prototyping (Jupyter)
 ├── data/                   # Local data cache
 ├── app.py                  # Streamlit Frontend Entry Point
+├── demo.ipynb              # [NEW] Standalone Pipeline Walkthrough
 ├── requirements.txt        # Python dependencies
 └── README.md               # Documentation
 
@@ -102,6 +103,27 @@ streamlit run app.py
 
 ---
 
+## 📓 Jupyter Notebook Demo (Code Walkthrough)
+
+For a transparent, code-first walkthrough of the entire quantitative pipeline (without launching the web UI), refer to **`demo.ipynb`**.
+
+This notebook is designed for **Research & Code Review**, allowing you to step through the logic block-by-block:
+
+1. **Pipeline Transparency:** Explicitly initializes `VolatilitySurface` and calls calibration methods, showing the raw backend logic.
+2. **Visual Validation:** Displays intermediate plots (SVI Smile Fits, 3D Surfaces, Hedging Profiles) directly inline.
+3. **Research Sandbox:** Ideal for testing new pricing parameters or modifying the Monte Carlo simulation logic on the fly.
+
+**How to Run:**
+
+* **Option A (VS Code - Recommended):** simply open `demo.ipynb` in VS Code and click **"Run All"**.
+* **Option B (Command Line):**
+```bash
+jupyter notebook demo.ipynb
+
+```
+
+---
+
 ## 📊 Methodology Highlight
 
 ### Why SVI?
@@ -131,4 +153,3 @@ While Implied Volatility represents the market's *average* expectation, **Local 
 * **Future:**
 * Implement Heston Stochastic Volatility Model calibration.
 * Add Gamma and Vega bucketing for PnL attribution.
-
