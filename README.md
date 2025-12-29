@@ -1,10 +1,12 @@
+# Volatility Surface Modelling & Pricing Engine
+
 ## 📖 Project Overview
 
 This project is an industrial-grade quantitative finance pipeline designed to construct, visualize, and utilize **Implied Volatility Surfaces** for the S&P 500 ETF (SPY).
 
-Unlike simple interpolation scripts, this engine implements a rigorous **SVI (Stochastic Volatility Inspired)** calibration on real-time market data, ensuring arbitrage-free smoothing of volatility smiles. The system is decoupled into a robust backend (ETL & Calculation Engine) and an interactive frontend (Streamlit Dashboard).
+Going beyond simple interpolation, this engine implements a rigorous **SVI (Stochastic Volatility Inspired)** calibration on real-time market data to ensure arbitrage-free smoothing. It then derives the **Local Volatility Surface** using Dupire's formula and employs it in a **Monte Carlo Pricing Engine** to price exotic derivatives (Barrier Options).
 
-**Core Objective:** To bridge the gap between raw, noisy market options data and a tradeable volatility surface suitable for exotic derivative pricing.
+**Core Objective:** To bridge the gap between raw, noisy market options data and a tradeable volatility surface suitable for pricing path-dependent exotics.
 
 ---
 
@@ -12,8 +14,9 @@ Unlike simple interpolation scripts, this engine implements a rigorous **SVI (St
 
 ### 1. Robust Data ETL (`src/data_loader.py`)
 * **Real-time Connection:** Fetches live Option Chain data via Yahoo Finance API.
-* **Smart Cleaning:** * Filters for liquidity (Volume/OI checks).
-    * Handles "dirty data" and zero-bid contracts.
+* **Smart Cleaning:**
+    * Filters for liquidity using **Open Interest** and Volume checks.
+    * Eliminates "dirty data" (e.g., zero-volatility quotes) to prevent model distortion.
     * Precisely calculates Time-to-Maturity ($T$) using trading calendars.
 * **Rate Bootstrapping:** Dynamically fetches the risk-free rate ($r$) using the 13-Week Treasury Bill (`^IRX`) as a proxy.
 
@@ -24,14 +27,20 @@ Unlike simple interpolation scripts, this engine implements a rigorous **SVI (St
     $$w(k) = a + b \left\{ \rho(k - m) + \sqrt{(k - m)^2 + \sigma^2} \right\}$$
     *Where $w$ is total variance and $k$ is log-moneyness.*
 
-### 3. Volatility Surface Construction (`src/vol_surface.py`)
-* **Time Interpolation:** Constructs a dense grid by linearly interpolating Total Variance ($w$) in the time dimension.
-* **Arbitrage Checks:** Implicitly handles calendar arbitrage through variance interpolation.
-* **3D Mesh Generation:** Exports vectorized coordinates for visualization.
+### 3. Surface Construction & Local Volatility (`src/vol_surface.py`)
+* **Implied Volatility Surface:** Constructs a dense grid by linearly interpolating Total Variance ($w$) in the time dimension.
+* **Dupire's Local Volatility:** Implements **Finite Difference** methods to numerically calculate partial derivatives ($\frac{\partial w}{\partial T}$, $\frac{\partial w}{\partial k}$) and extract the instantaneous Local Volatility surface $\sigma_{loc}(S, t)$.
+    * *Crucial for pricing path-dependent options where the smile dynamics matter.*
 
-### 4. Interactive Dashboard (`app.py`)
-* **3D Visualization:** Fully interactive Plotly 3D surface to inspect Skew and Term Structure.
-* **Smile Inspection:** Drill-down capability to view raw market data vs. fitted SVI curves for specific maturities.
+### 4. Exotic Pricing Engine (`src/pricer.py`)
+* **Monte Carlo Simulation:** Simulates 10,000+ asset price paths using Geometric Brownian Motion.
+* **Dynamic Volatility:** Supports path generation using **Local Volatility** lookup (surface interpolation) at each time step.
+* **Barrier Option Pricing:** Prices **Down-and-Out Call** options and compares results against Black-Scholes (Constant Vol) to demonstrate **Model Risk** and the impact of Skew.
+
+### 5. Interactive Dashboard (`app.py`)
+* **3D Visualization:** Fully interactive Plotly 3D surfaces for both Implied and Local Volatility.
+* **Pricing Playground:** Real-time Monte Carlo simulation runner with adjustable parameters (Barrier Level, Strike, Maturity).
+* **Smile Inspection:** Drill-down capability to view raw market data vs. fitted SVI curves.
 
 ---
 
@@ -44,8 +53,8 @@ volatility-surface-modelling/
 │   ├── data_loader.py      # ETL pipeline for options data
 │   ├── rates.py            # Risk-free rate service
 │   ├── svi_model.py        # SVI calibration logic (Optimizer)
-│   ├── vol_surface.py      # Surface construction & interpolation
-│   └── pricer.py           # [Planned] Monte Carlo Pricing Engine
+│   ├── vol_surface.py      # Surface construction & Dupire Local Vol
+│   └── pricer.py           # Monte Carlo Pricing Engine (Barrier Options)
 ├── notebooks/              # Research & Prototyping (Jupyter)
 ├── data/                   # Local data cache
 ├── app.py                  # Streamlit Frontend Entry Point
@@ -90,18 +99,32 @@ streamlit run app.py
 
 ---
 
-## 📊 Methodology Highlight: Why SVI?
+## 📊 Methodology Highlight
 
-We chose the **SVI (Stochastic Volatility Inspired)** parameterization over cubic splines or polynomial regression for several reasons critical in a sell-side context:
+### Why SVI?
 
-1. **Asymptotic Behavior:** SVI ensures that variance is linear in the wings (), preventing the "Runge Phenomenon" (wild oscillations) common in polynomial fits.
-2. **Arbitrage Constraints:** SVI parameters can be constrained to ensure the density function remains positive (no static arbitrage).
-3. **Interpretability:** Parameters like  directly map to the market skew (correlation between spot and vol), offering traders intuitive insights.
+We chose the **SVI (Stochastic Volatility Inspired)** parameterization for implied volatility smoothing because:
+
+1. **Asymptotic Behavior:** SVI ensures linear variance in the wings (), preventing wild oscillations common in polynomial fits.
+2. **Arbitrage Constraints:** Parameters can be constrained to ensure the density function remains positive (no static arbitrage).
+
+### Why Local Volatility?
+
+While Implied Volatility represents the market's *average* expectation, **Local Volatility** represents the *instantaneous* volatility at a specific spot and time.
+
+* **Dupire's Formula:** By extracting Local Volatility from the calibrated surface, we can price **Barrier Options** more accurately.
+* **Skew Impact:** The model captures the "Leverage Effect"—where local volatility spikes as the asset price drops—leading to more realistic pricing of Down-and-Out options compared to the flat Black-Scholes model.
 
 ---
 
 ## 🔜 Roadmap
 
-* **Phase 1-3:** Data ETL, SVI Calibration, 3D Surface (✅ Completed)
-* **Phase 4:** **Local Volatility (Dupire)** extraction from the Implied Vol Surface.
-* **Phase 5:** **Exotic Pricing Engine**. Implementing a Monte Carlo pricer for Barrier Options using the generated Local Volatility surface.
+* **Phase 1:** Data ETL & Cleaning (✅ Completed)
+* **Phase 2:** SVI Calibration & Implied Vol Surface (✅ Completed)
+* **Phase 3:** Local Volatility (Dupire) Extraction (✅ Completed)
+* **Phase 4:** Monte Carlo Pricing Engine for Exotics (✅ Completed)
+* **Phase 5:** Dashboard & Visualization (✅ Completed)
+* **Future:**
+* Implement Heston Stochastic Volatility Model calibration.
+* Add Greeks calculation (Delta, Vega, Gamma) for the surface.
+```
