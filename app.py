@@ -16,10 +16,18 @@ ticker = st.sidebar.text_input("Ticker Symbol", value="SPY")
 build_btn = st.sidebar.button("Build Surface 🚀")
 
 st.sidebar.markdown("---")
-# FIX: Use Radio button for navigation to prevent "Tab Jumping" on re-runs
+
+# Navigation Menu
+# Added "Hedging & Greeks Analysis" as Module 3
 nav_option = st.sidebar.radio(
     "Select Module", 
-    ["1. 3D Volatility Surfaces", "2. Exotic Pricing Engine", "3. Smile Calibration", "4. Raw Data Inspector"]
+    [
+        "1. 3D Volatility Surfaces", 
+        "2. Exotic Pricing Engine", 
+        "3. Hedging & Greeks Analysis", 
+        "4. Smile Calibration", 
+        "5. Raw Data Inspector"
+    ]
 )
 
 # --- 2. State Management ---
@@ -33,13 +41,15 @@ if build_btn:
             st.success(f"Successfully calibrated {len(surface.svi_params)} expiration slices!")
         except Exception as e:
             st.error(f"An error occurred: {e}")
+            import traceback
+            st.text(traceback.format_exc())
 
 # --- 3. Main Logic ---
 if 'vol_surface_obj' in st.session_state:
     surface = st.session_state['vol_surface_obj']
     
     # ---------------------------------------------------------
-    # Module 1: 3D Surfaces
+    # Module 1: 3D Volatility Surfaces
     # ---------------------------------------------------------
     if nav_option == "1. 3D Volatility Surfaces":
         st.subheader("Implied vs. Local Volatility Topology")
@@ -64,7 +74,7 @@ if 'vol_surface_obj' in st.session_state:
             st.plotly_chart(fig_loc, use_container_width=True)
 
     # ---------------------------------------------------------
-    # Module 2: Exotic Pricing Engine (FIXED)
+    # Module 2: Exotic Pricing Engine
     # ---------------------------------------------------------
     elif nav_option == "2. Exotic Pricing Engine":
         st.subheader("📉 Barrier Option Pricer (Down-and-Out Call)")
@@ -83,7 +93,7 @@ if 'vol_surface_obj' in st.session_state:
             
         with col_p3:
             r_rate = st.number_input("Risk Free Rate", value=0.045)
-            n_sims = st.slider("Monte Carlo Paths", 1000, 5000, 2000)
+            n_sims = st.slider("Monte Carlo Paths", 1000, 10000, 2000)
 
         # Run Button
         if st.button("Run Monte Carlo Simulation 🎲"):
@@ -97,10 +107,10 @@ if 'vol_surface_obj' in st.session_state:
                 # 2. Local Vol
                 res_lv = pricer.price_barrier_option(strike, barrier, model="local_vol", n_paths=n_sims)
                 
-                # Store results in session state to prevent disappearance
+                # Store results in session state
                 st.session_state['pricing_res'] = (res_bs, res_lv, atm_vol)
 
-        # Display Results if they exist
+        # Display Results
         if 'pricing_res' in st.session_state:
             res_bs, res_lv, atm_vol = st.session_state['pricing_res']
             
@@ -110,31 +120,130 @@ if 'vol_surface_obj' in st.session_state:
             c2.metric("Black-Scholes Price", f"${res_bs['price']:.2f}")
             
             diff = res_lv['price'] - res_bs['price']
-            color = "normal" if diff < 0 else "inverse" # Green if cheaper, Red if expensive
+            color = "normal" if diff < 0 else "inverse"
             c3.metric("Local Vol Price", f"${res_lv['price']:.2f}", delta=f"{diff:.2f}", delta_color=color)
 
-            # Dynamic Analysis Text
             st.info("💡 **Model Risk Analysis:**")
-            
             if res_lv['price'] < res_bs['price']:
                 st.markdown(f"""
-                **Result: Local Vol < Black-Scholes.** This is the classic "Skew Effect" for Down-and-Out Calls.
-                * The Local Volatility surface implies higher volatility on the downside (near the barrier).
-                * This **increases the probability of hitting the barrier** compared to the constant ATM volatility assumption.
-                * **Conclusion:** The Black-Scholes model is likely **overpricing** this option by ignoring the skew risk.
+                **Result: Local Vol < Black-Scholes.** This is the classic "Skew Effect".
+                The model sees higher volatility on the downside (near the barrier), increasing the knock-out probability.
                 """)
             else:
                 st.markdown(f"""
-                **Result: Local Vol > Black-Scholes.** This indicates a "Vega Dominance" scenario.
-                * While the barrier risk exists, the Local Volatility model might be picking up **significantly higher volatility** along the surviving paths (Upside or Recovery).
-                * Notice the spikes in your Local Vol surface? If the path passes through those high-vol zones, the option accumulates more value (Vega) than the barrier risk takes away.
-                * **Conclusion:** The Black-Scholes model might be **underpricing** the potential volatility of the asset if it stays alive.
+                **Result: Local Vol > Black-Scholes.** This indicates "Vega Dominance".
+                The volatility along the survival paths is high enough to compensate for the barrier risk.
                 """)
 
     # ---------------------------------------------------------
-    # Module 3: Smile Calibration
+    # Module 3: Hedging & Greeks Analysis (NEW)
     # ---------------------------------------------------------
-    elif nav_option == "3. Smile Calibration":
+    elif nav_option == "3. Hedging & Greeks Analysis":
+        st.subheader("🛡️ Hedge Effectiveness Analysis (Delta Profile)")
+        st.markdown("""
+        **Scenario:** You sold a Down-and-Out Call and need to hedge. 
+        This chart compares the **Delta (Hedge Ratio)** calculated by Black-Scholes vs. Local Volatility as the spot price moves.
+        """)
+        
+        # Parameters
+        col_h1, col_h2 = st.columns(2)
+        with col_h1:
+            S_current = surface.spot_price
+            barrier_level = st.number_input("Barrier Level", value=float(int(S_current * 0.85)), key="h_bar")
+            strike_level = st.number_input("Strike Price", value=float(int(S_current * 1.05)), key="h_str")
+        with col_h2:
+            T_hedge = st.number_input("Time to Mat", value=1.0, key="h_t")
+            n_sims_hedge = st.slider("Simulations per Point", 500, 5000, 2000, key="h_sims")
+            
+        if st.button("Calculate Delta Profile 📉"):
+            # Progress bar for UX
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            # Generate Spot Range (From 95% of Barrier to 110% of Spot)
+            spot_range = np.linspace(barrier_level * 0.95, S_current * 1.1, 15)
+            
+            bs_deltas = []
+            lv_deltas = []
+            
+            # Use a fixed ATM vol for BS comparison
+            atm_vol_fixed = surface.get_implied_vol(0, T_hedge)
+            
+            try:
+                for i, s_val in enumerate(spot_range):
+                    status_text.text(f"Calculating Delta for Spot Price ${s_val:.2f}...")
+                    
+                    # Create temporary pricer at hypothetical spot s_val
+                    # r is fixed at 0.045 for simplicity or fetch from rates
+                    temp_pricer = MonteCarloPricer(s_val, 0.045, T_hedge, surface)
+                    
+                    # 1. BS Delta
+                    # Note: We assume pricer.calculate_delta uses the barrier option logic
+                    d_bs = temp_pricer.calculate_delta(
+                        strike_level, barrier_level, 
+                        model="black_scholes", 
+                        n_paths=n_sims_hedge
+                    )
+                    bs_deltas.append(d_bs)
+                    
+                    # 2. Local Vol Delta
+                    d_lv = temp_pricer.calculate_delta(
+                        strike_level, barrier_level, 
+                        model="local_vol", 
+                        n_paths=n_sims_hedge
+                    )
+                    lv_deltas.append(d_lv)
+                    
+                    # Update progress
+                    progress_bar.progress((i + 1) / len(spot_range))
+                
+                status_text.text("Calculation Complete!")
+                
+                # Plotting
+                fig_delta = go.Figure()
+                
+                # BS Line
+                fig_delta.add_trace(go.Scatter(
+                    x=spot_range, y=bs_deltas, 
+                    mode='lines+markers', name='Black-Scholes Delta', 
+                    line=dict(color='gray', dash='dash')
+                ))
+                
+                # Local Vol Line
+                fig_delta.add_trace(go.Scatter(
+                    x=spot_range, y=lv_deltas, 
+                    mode='lines+markers', name='Local Vol Delta', 
+                    line=dict(color='red', width=3)
+                ))
+                
+                # Add Barrier Line
+                fig_delta.add_vline(x=barrier_level, line_width=2, line_dash="dot", line_color="black", annotation_text="Barrier")
+                
+                fig_delta.update_layout(
+                    title="Delta Profile: Hedging Ratio vs. Spot Price",
+                    xaxis_title="Spot Price",
+                    yaxis_title="Option Delta",
+                    hovermode="x unified",
+                    height=600
+                )
+                st.plotly_chart(fig_delta, use_container_width=True)
+                
+                st.info("""
+                **Quant Insight:**
+                Observe the behavior near the **Barrier (Black Line)**. 
+                * **Local Vol Delta** often drops faster or behaves more aggressively because the model anticipates the volatility spike associated with the crash risk.
+                * Relying on the Gray Line (BS) for hedging could lead to significant under-hedging in a sell-off scenario.
+                """)
+                
+            except AttributeError:
+                st.error("Error: `calculate_delta` method not found in `MonteCarloPricer`. Please ensure `src/pricer.py` is updated.")
+            except Exception as e:
+                st.error(f"An error occurred during calculation: {e}")
+
+    # ---------------------------------------------------------
+    # Module 4: Smile Calibration
+    # ---------------------------------------------------------
+    elif nav_option == "4. Smile Calibration":
         st.subheader("SVI Fit Inspection")
         available_expiries = sorted(surface.svi_params.keys())
         if available_expiries:
@@ -155,9 +264,9 @@ if 'vol_surface_obj' in st.session_state:
                 st.plotly_chart(fig_2d, use_container_width=True)
 
     # ---------------------------------------------------------
-    # Module 4: Raw Data
+    # Module 5: Raw Data
     # ---------------------------------------------------------
-    elif nav_option == "4. Raw Data Inspector":
+    elif nav_option == "5. Raw Data Inspector":
         st.subheader("Cleaned Market Data")
         st.dataframe(surface.raw_data)
 

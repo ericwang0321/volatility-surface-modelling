@@ -1,12 +1,12 @@
-# Volatility Surface Modelling & Pricing Engine
+ Volatility Surface Modelling & Pricing Engine
 
 ## 📖 Project Overview
 
 This project is an industrial-grade quantitative finance pipeline designed to construct, visualize, and utilize **Implied Volatility Surfaces** for the S&P 500 ETF (SPY).
 
-Going beyond simple interpolation, this engine implements a rigorous **SVI (Stochastic Volatility Inspired)** calibration on real-time market data to ensure arbitrage-free smoothing. It then derives the **Local Volatility Surface** using Dupire's formula and employs it in a **Monte Carlo Pricing Engine** to price exotic derivatives (Barrier Options).
+Going beyond simple interpolation, this engine implements a rigorous **SVI (Stochastic Volatility Inspired)** calibration on real-time market data to ensure arbitrage-free smoothing. It then derives the **Local Volatility Surface** using Dupire's formula and employs it in a **Monte Carlo Pricing Engine** to price exotic derivatives (Barrier Options) and analyze **Hedging Risks**.
 
-**Core Objective:** To bridge the gap between raw, noisy market options data and a tradeable volatility surface suitable for pricing path-dependent exotics.
+**Core Objective:** To bridge the gap between raw, noisy market options data and a tradeable volatility surface suitable for pricing and hedging path-dependent exotics.
 
 ---
 
@@ -30,17 +30,20 @@ Going beyond simple interpolation, this engine implements a rigorous **SVI (Stoc
 ### 3. Surface Construction & Local Volatility (`src/vol_surface.py`)
 * **Implied Volatility Surface:** Constructs a dense grid by linearly interpolating Total Variance ($w$) in the time dimension.
 * **Dupire's Local Volatility:** Implements **Finite Difference** methods to numerically calculate partial derivatives ($\frac{\partial w}{\partial T}$, $\frac{\partial w}{\partial k}$) and extract the instantaneous Local Volatility surface $\sigma_{loc}(S, t)$.
-    * *Crucial for pricing path-dependent options where the smile dynamics matter.*
 
 ### 4. Exotic Pricing Engine (`src/pricer.py`)
 * **Monte Carlo Simulation:** Simulates 10,000+ asset price paths using Geometric Brownian Motion.
 * **Dynamic Volatility:** Supports path generation using **Local Volatility** lookup (surface interpolation) at each time step.
-* **Barrier Option Pricing:** Prices **Down-and-Out Call** options and compares results against Black-Scholes (Constant Vol) to demonstrate **Model Risk** and the impact of Skew.
+* **Barrier Option Pricing:** Prices **Down-and-Out Call** options and compares results against Black-Scholes (Constant Vol) to demonstrate **Model Risk**.
 
-### 5. Interactive Dashboard (`app.py`)
+### 5. Risk Management & Hedging Analysis (New!)
+* **Delta Profiling:** Calculates the option's Delta ($\Delta$) across a range of spot prices using Finite Difference methods ("Bump and Revalue").
+* **Hedge Effectiveness:** Visualizes the divergence between **Black-Scholes Delta** and **Local Volatility Delta** near barrier levels, highlighting the "Delta Skew" risk that leads to under/over-hedging.
+
+### 6. Interactive Dashboard (`app.py`)
 * **3D Visualization:** Fully interactive Plotly 3D surfaces for both Implied and Local Volatility.
-* **Pricing Playground:** Real-time Monte Carlo simulation runner with adjustable parameters (Barrier Level, Strike, Maturity).
-* **Smile Inspection:** Drill-down capability to view raw market data vs. fitted SVI curves.
+* **Pricing Playground:** Real-time Monte Carlo simulation runner with adjustable parameters.
+* **Hedging Analysis Module:** Interactive chart comparing Delta profiles of different models.
 
 ---
 
@@ -54,7 +57,7 @@ volatility-surface-modelling/
 │   ├── rates.py            # Risk-free rate service
 │   ├── svi_model.py        # SVI calibration logic (Optimizer)
 │   ├── vol_surface.py      # Surface construction & Dupire Local Vol
-│   └── pricer.py           # Monte Carlo Pricing Engine (Barrier Options)
+│   └── pricer.py           # Monte Carlo Pricing & Greeks Engine
 ├── notebooks/              # Research & Prototyping (Jupyter)
 ├── data/                   # Local data cache
 ├── app.py                  # Streamlit Frontend Entry Point
@@ -124,7 +127,8 @@ While Implied Volatility represents the market's *average* expectation, **Local 
 * **Phase 3:** Local Volatility (Dupire) Extraction (✅ Completed)
 * **Phase 4:** Monte Carlo Pricing Engine for Exotics (✅ Completed)
 * **Phase 5:** Dashboard & Visualization (✅ Completed)
+* **Phase 6:** **Hedging & Greeks Analysis (Delta Profile)** (✅ Completed)
 * **Future:**
 * Implement Heston Stochastic Volatility Model calibration.
-* Add Greeks calculation (Delta, Vega, Gamma) for the surface.
-```
+* Add Gamma and Vega bucketing for PnL attribution.
+

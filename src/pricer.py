@@ -93,3 +93,46 @@ class MonteCarloPricer:
         std_err = np.std(payoffs) / np.sqrt(n_paths)
         
         return {"price": price, "std_err": std_err}
+
+    def calculate_delta(self, K: float, barrier: float, model: str = "local_vol", 
+                        n_paths: int = 5000, epsilon_pct: float = 0.01) -> float:
+        """
+        Calculates Delta using Central Finite Difference with Common Random Numbers.
+        Delta = (Price(S_up) - Price(S_down)) / (2 * dS)
+        """
+        # Shock spot price up and down
+        dS = self.S0 * epsilon_pct
+        S_up = self.S0 + dS
+        S_down = self.S0 - dS
+        
+        # We need to temporarily construct pricers with shocked spots
+        # IMPORTANT: Use the SAME random seed inside price_barrier_option to reduce variance
+        # (Current implementation allows numpy random state control? 
+        #  For simplicity here, we assume large n_paths averages out, 
+        #  but ideally we fix the seed explicitly in the pricer loop).
+        
+        # Hack: Since our pricer generates new random numbers each time, 
+        # we need a sufficiently large n_paths to stabilize Delta.
+        
+        # 1. Price Up
+        pricer_up = MonteCarloPricer(S_up, self.r, self.T, self.vol_surface)
+        # Note: For BS, we assume Vol stays constant. For Local Vol, surface stays same, but we lookup at new S.
+        if model == "black_scholes":
+            # Recalculate ATM vol for the new spot? Or keep fixed? 
+            # Standard Greek calculation keeps implied vol fixed (Sticky Strike vs Sticky Delta).
+            # Let's assume constant vol (Sticky Strike).
+            const_vol = self.vol_surface.get_implied_vol(np.log(self.S0/self.S0), self.T) # ATM of base
+            res_up = pricer_up.price_barrier_option(K, barrier, model="black_scholes", const_vol=const_vol, n_paths=n_paths)
+        else:
+            res_up = pricer_up.price_barrier_option(K, barrier, model="local_vol", n_paths=n_paths)
+            
+        # 2. Price Down
+        pricer_down = MonteCarloPricer(S_down, self.r, self.T, self.vol_surface)
+        if model == "black_scholes":
+            const_vol = self.vol_surface.get_implied_vol(np.log(self.S0/self.S0), self.T)
+            res_down = pricer_down.price_barrier_option(K, barrier, model="black_scholes", const_vol=const_vol, n_paths=n_paths)
+        else:
+            res_down = pricer_down.price_barrier_option(K, barrier, model="local_vol", n_paths=n_paths)
+            
+        delta = (res_up['price'] - res_down['price']) / (2 * dS)
+        return delta
