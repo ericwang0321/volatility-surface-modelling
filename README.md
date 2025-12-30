@@ -24,7 +24,16 @@ Going beyond simple interpolation, this engine implements a rigorous **SVI (Stoc
 
 * Implements the **Raw SVI Parameterization** model to fit volatility smiles for each expiration slice.
 * **Optimization:** Uses `scipy.optimize` with bounded constraints to ensure model stability ($b > 0$, $|\rho| < 1$, $\sigma > 0$).
-* **Formula:** $w(k) = a + b \left\{ \rho(k - m) + \sqrt{(k - m)^2 + \sigma^2} \right\}$ , where $w$ is total variance ($\sigma_{BS}^2 T$) and $k$ is log-moneyness.*
+* **Formula:**
+
+$$
+w(k) = a + b \{ \rho (k - m) + \sqrt{(k - m)^2 + \sigma^2} \}
+$$
+
+where  
+- $w$ is total variance $(\sigma_{\text{BS}}^2 T)$  
+- $k$ is log-moneyness
+
 
 > **Visual Proof:** The model fits the raw market data (red dots) with high precision, ensuring a smooth, arbitrage-free curve (blue line).
 >
