@@ -92,59 +92,38 @@ class VolatilitySurface:
     def get_local_vol(self, S_t: float, t: float) -> float:
         """
         Calculates Local Volatility using Dupire's Formula via Finite Differences.
-        
-        Args:
-            S_t: Current asset price
-            t: Current time to maturity
-            
-        Returns:
-            Local Volatility (sigma_loc)
+        Includes safeguards against numerical instability.
         """
         if not self.svi_params:
             raise ValueError("Surface not built.")
 
-        # 1. Convert Spot to Log-Moneyness k = ln(K/S_0)
-        # Note: In Dupire, we usually fix Strike K and vary T. 
-        # Here we approximate: k corresponds to the log-moneyness of the strike relative to current spot.
-        # Let's use the standard representation: w(k, t) where k = log(K/Spot)
-        
-        # We need derivatives at (k, t). Let's assume K = S_t (ATM) for the path simulation,
-        # but technically Dupire uses K.
-        # k = ln(K / S_0).
-        # For the pricer, we need sigma_loc(S_t, t). 
-        # Relation: k = ln(S_t / S_0) (if we view it as spot evolution)
-        
+        # Cap time to avoid division by zero
+        if t < 0.001: t = 0.001
+            
+        # Current Implied Vol (Fallback)
         k = np.log(S_t / self.spot_price)
+        imp_vol = self.get_implied_vol(k, t)
         
-        # Small perturbations for Finite Difference
-        dt = 0.001
-        dk = 0.01
+        # Finite Difference Steps
+        dt = 0.005 # Increased slightly for stability
+        dk = 0.02
 
-        # 2. Get Total Variance w(k, t)
-        # w = sigma_imp^2 * t
         def get_w(k_val, t_val):
-            # Clamp t to avoid looking up T<0
-            if t_val < 1e-4: t_val = 1e-4
+            t_val = max(1e-4, t_val)
             vol = self.get_implied_vol(k_val, t_val)
             return (vol ** 2) * t_val
 
         w = get_w(k, t)
 
-        # 3. Calculate Derivatives (Central Difference)
-        # dw/dt (Time slope)
+        # Derivatives
         dw_dt = (get_w(k, t + dt) - get_w(k, t - dt)) / (2 * dt)
-        
-        # dw/dk (Strike slope)
         dw_dk = (get_w(k + dk, t) - get_w(k - dk, t)) / (2 * dk)
-        
-        # d2w/dk2 (Strike curvature)
         d2w_dk2 = (get_w(k + dk, t) - 2*w + get_w(k - dk, t)) / (dk ** 2)
 
-        # 4. Dupire Formula
-        # numerator = dw/dt
-        # denominator = 1 - (k/w)*dw/dk + 0.25*(-0.25 - 1/w + (k/w)^2)*(dw/dk)^2 + 0.5*d2w/dk2
+        # Dupire Denominator
+        # Formula: 1 - (k/w)*dw/dk + 0.25*(-0.25 - 1/w + (k/w)^2)*(dw/dk)^2 + 0.5*d2w/dk2
         
-        # Safety checks to avoid division by zero
+        # Safety: w cannot be 0
         if w < 1e-6: w = 1e-6
         
         term1 = 1 - (k / w) * dw_dk
@@ -153,17 +132,26 @@ class VolatilitySurface:
         
         denominator = term1 + term2 + term3
         
-        # Sanity check for negative variance (Arbitrage violation)
-        if denominator < 1e-6 or dw_dt < 0:
-            # Fallback to Implied Vol if Dupire fails locally
-            return np.sqrt(w / t) if t > 0 else 0.0
+        # 1. Negative time slope implies Calendar Arbitrage (Var decreases with time)
+        if dw_dt < 0:
+            return imp_vol
+            
+        # 2. Denominator close to zero or negative implies Static Arbitrage
+        if denominator < 1e-4:
+            return imp_vol
             
         var_loc = dw_dt / denominator
         
-        if var_loc < 0: 
-            return np.sqrt(w / t) # Fallback
+        if var_loc < 0:
+            return imp_vol
             
-        return np.sqrt(var_loc)
+        vol_loc = np.sqrt(var_loc)
+        
+        # 3. Cap extreme spikes (e.g., > 300% vol is likely numerical noise for SPY)
+        if vol_loc > 3.0: 
+            return imp_vol
+            
+        return vol_loc
 
     def get_mesh_grid(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
