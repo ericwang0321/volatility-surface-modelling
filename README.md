@@ -27,7 +27,7 @@ Going beyond simple interpolation, this engine implements a rigorous **SVI (Stoc
 * **Formula:**
     $$w(k) = a + b \left\{ \rho(k - m) + \sqrt{(k - m)^2 + \sigma^2} \right\}$$
     *Where $w$ is total variance ($\sigma_{BS}^2 T$) and $k$ is log-moneyness.*
-
+    
 > **Visual Proof:** The model fits the raw market data (red dots) with high precision, ensuring a smooth, arbitrage-free curve (blue line).
 >
 > ![SVI Calibration Fit](images/svi_fit.png)
