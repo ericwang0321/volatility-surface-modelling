@@ -1,5 +1,4 @@
 import numpy as np
-from scipy.stats import norm
 import logging
 
 # Configure logger
@@ -9,6 +8,7 @@ class MonteCarloPricer:
     """
     Pricing Engine using Monte Carlo Simulation.
     Supports both Black-Scholes (Constant Vol) and Local Volatility models.
+    Updated to use Fast Grid Interpolation for Local Volatility.
     """
 
     def __init__(self, S0: float, r: float, T: float, vol_surface=None):
@@ -22,9 +22,8 @@ class MonteCarloPricer:
                            const_vol: float = 0.2, seed: int = None) -> dict:
         """
         Prices a Barrier Option. 
-        ADDED: 'seed' parameter for Common Random Numbers (CRN).
+        Uses Grid Interpolation for Local Volatility to improve performance.
         """
-        # --- FIX: Set Random Seed if provided ---
         if seed is not None:
             np.random.seed(seed)
             
@@ -33,29 +32,38 @@ class MonteCarloPricer:
         
         S = np.full(n_paths, self.S0)
         alive = np.full(n_paths, True, dtype=bool)
+
+        # --- OPTIMIZATION: Ensure Interpolator is built ---
+        if model == "local_vol":
+            if self.vol_surface is None:
+                raise ValueError("Vol Surface required for Local Vol pricing.")
+            if self.vol_surface.interpolator is None:
+                self.vol_surface.build_local_vol_interpolator()
         
         for i in range(n_steps):
             t_current = i * dt
             
             # 1. Determine Volatility
             if model == "local_vol":
-                # Vectorized lookup
-                # Optimization: We assume S > 0, clip extreme lookups
-                S_lookup = np.maximum(S, 0.01) 
+                # --- Vectorized Fast Lookup ---
+                # Create coordinate pairs [S, t] for all paths at once
+                # Shape: (n_paths, 2)
                 
-                # Using a vectorized wrapper for the surface method
-                # Note: For strict performance, this loop should be optimized further, 
-                # but for this demo, vectorizing the method call is sufficient.
-                # We catch errors to prevent crash on single path failure
-                try:
-                    # Creating a simple vectorized function on the fly is slow, 
-                    # better to iterate if get_local_vol isn't natively vectorized.
-                    # Here we assume get_local_vol handles scalar inputs.
-                    sigma = np.array([self.vol_surface.get_local_vol(s, t_current) for s in S_lookup])
-                except:
-                    sigma = np.full(n_paths, 0.2) # Fallback
-
-                sigma = np.clip(sigma, 0.01, 1.0) # Safety clamp
+                # Safety: Clip S to ensure it stays within interpolation bounds
+                # (Optional, but good practice. Using reasonable grid limits usually sufficient)
+                S_clipped = np.clip(S, self.vol_surface.interp_s_grid[0], self.vol_surface.interp_s_grid[-1])
+                
+                # Broadcast time t_current to match dimension of S
+                t_vec = np.full(n_paths, t_current)
+                
+                # Stack into (N, 2) array
+                points = np.column_stack((S_clipped, t_vec))
+                
+                # Query interpolator (O(1) operation per point, vectorized)
+                sigma = self.vol_surface.get_local_vol_fast(points)
+                
+                # Safety clamp for sigma
+                sigma = np.clip(sigma, 0.01, 1.0) 
             else:
                 sigma = np.full(n_paths, const_vol)
 
@@ -86,18 +94,17 @@ class MonteCarloPricer:
         S_up = self.S0 + dS
         S_down = self.S0 - dS
         
-        # --- FIX: Generate a random seed to share between Up and Down scenarios ---
-        # This ensures that the ONLY difference between the two runs is the Spot Price,
-        # not the random path noise.
+        # --- Common Random Numbers (CRN) ---
         common_seed = np.random.randint(0, 1000000)
         
         # 1. Price Up
         pricer_up = MonteCarloPricer(S_up, self.r, self.T, self.vol_surface)
         
-        # For BS, keep vol constant (Sticky Strike assumption for simple delta)
         if model == "black_scholes":
-            # Use ATM vol of the *original* spot to keep comparison fair
-            const_vol = self.vol_surface.get_implied_vol(0, self.T)
+            if self.vol_surface:
+                const_vol = self.vol_surface.get_implied_vol(0, self.T)
+            else:
+                const_vol = 0.2
             res_up = pricer_up.price_barrier_option(K, barrier, model="black_scholes", 
                                                   const_vol=const_vol, n_paths=n_paths, seed=common_seed)
         else:
@@ -108,7 +115,11 @@ class MonteCarloPricer:
         pricer_down = MonteCarloPricer(S_down, self.r, self.T, self.vol_surface)
         
         if model == "black_scholes":
-            const_vol = self.vol_surface.get_implied_vol(0, self.T)
+            # Re-use same const_vol for fair comparison
+            if self.vol_surface:
+                const_vol = self.vol_surface.get_implied_vol(0, self.T)
+            else:
+                const_vol = 0.2
             res_down = pricer_down.price_barrier_option(K, barrier, model="black_scholes", 
                                                       const_vol=const_vol, n_paths=n_paths, seed=common_seed)
         else:

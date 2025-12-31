@@ -1,7 +1,8 @@
 import numpy as np
 import pandas as pd
 import logging
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
+from scipy.interpolate import RegularGridInterpolator  # <--- NEW IMPORT
 
 from src.svi_model import SVIModel
 from src.data_loader import DataLoader
@@ -12,6 +13,7 @@ logger = logging.getLogger(__name__)
 class VolatilitySurface:
     """
     Constructs the Volatility Surface and extracts Local Volatility using Dupire's Formula.
+    Now includes Grid Interpolation for fast Monte Carlo pricing.
     """
 
     def __init__(self, ticker: str = "SPY"):
@@ -23,6 +25,11 @@ class VolatilitySurface:
         
         self.moneyness_grid = np.linspace(0.8, 1.2, 50)
         self.time_grid = None 
+
+        # --- Optimization: Cache for Interpolator ---
+        self.interpolator = None
+        self.interp_s_grid = None
+        self.interp_t_grid = None
 
     def build(self):
         """
@@ -54,6 +61,57 @@ class VolatilitySurface:
                 logger.warning(f"Calibration failed for expiry T={T:.4f}")
 
         logger.info(f"Surface built. Calibrated {len(self.svi_params)} slices.")
+
+    def build_local_vol_interpolator(self, s_steps: int = 100, t_steps: int = 50):
+        """
+        Pre-computes the Local Volatility Surface onto a dense grid.
+        This allows O(1) lookup during Monte Carlo simulation instead of O(N) calculation.
+        """
+        if not self.svi_params:
+            self.build()
+
+        logger.info("Pre-computing Local Volatility Grid for Interpolation...")
+
+        # 1. Define Grid Boundaries
+        # Cover a wide range of Spot prices (e.g., -50% to +50% of current spot) to handle MC paths
+        s_min = self.spot_price * 0.5
+        s_max = self.spot_price * 1.5
+        t_max = max(self.time_grid) if self.time_grid else 1.0
+
+        # Create grids
+        self.interp_s_grid = np.linspace(s_min, s_max, s_steps)
+        self.interp_t_grid = np.linspace(0.001, t_max, t_steps) # Avoid t=0
+
+        # 2. Fill the Grid (Expensive part, runs once)
+        local_vol_matrix = np.zeros((len(self.interp_s_grid), len(self.interp_t_grid)))
+
+        for i, s_val in enumerate(self.interp_s_grid):
+            for j, t_val in enumerate(self.interp_t_grid):
+                # Calculate exact Dupire local vol
+                local_vol_matrix[i, j] = self.get_local_vol(s_val, t_val)
+
+        # 3. Create SciPy Interpolator
+        # bounds_error=False, fill_value=None allows extrapolation (nearest) if MC path goes slightly out of bounds
+        self.interpolator = RegularGridInterpolator(
+            (self.interp_s_grid, self.interp_t_grid), 
+            local_vol_matrix, 
+            bounds_error=False, 
+            fill_value=None 
+        )
+        logger.info("Local Volatility Interpolator ready.")
+
+    def get_local_vol_fast(self, points: np.ndarray) -> np.ndarray:
+        """
+        Vectorized lookup for Local Volatility.
+        Args:
+            points: Array of shape (N, 2) containing [[S1, t1], [S2, t2], ...]
+        Returns:
+            Array of volatilities.
+        """
+        if self.interpolator is None:
+            self.build_local_vol_interpolator()
+        
+        return self.interpolator(points)
 
     def get_implied_vol(self, k: float, T: float) -> float:
         """
@@ -101,7 +159,10 @@ class VolatilitySurface:
         if t < 0.001: t = 0.001
             
         # Current Implied Vol (Fallback)
+        # Handle cases where S_t is zero or negative (though unlikely for log-assets)
+        if S_t <= 0: S_t = 0.01
         k = np.log(S_t / self.spot_price)
+        
         imp_vol = self.get_implied_vol(k, t)
         
         # Finite Difference Steps
@@ -162,7 +223,6 @@ class VolatilitySurface:
             self.build()
             
         valid_times = sorted(self.svi_params.keys())
-        # Filter times to avoid T=0 issues
         valid_times = [t for t in valid_times if t > 0.05]
         
         X, Y = np.meshgrid(self.moneyness_grid, valid_times)
@@ -172,18 +232,9 @@ class VolatilitySurface:
         for i, t in enumerate(valid_times):
             for j, m_val in enumerate(self.moneyness_grid):
                 k = np.log(m_val)
-                # Spot price implied by moneyness: S = S0 * exp(-k) ?? 
-                # Actually simpler: moneyness = K/S0 -> K = m_val * S0
-                # Dupire takes S_t. If we are plotting surface over Moneyness K/S0,
-                # we calculate Local Vol assuming the Spot moves to that Strike level.
                 S_equivalent = self.spot_price * m_val
                 
                 Z_imp[i, j] = self.get_implied_vol(k, t)
                 Z_loc[i, j] = self.get_local_vol(S_equivalent, t)
                 
         return X, Y, Z_imp, Z_loc
-
-# --- Test Block ---
-if __name__ == "__main__":
-    surface = VolatilitySurface("SPY")
-    surface.build()
