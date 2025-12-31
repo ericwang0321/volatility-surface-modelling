@@ -16,91 +16,75 @@ Going beyond simple interpolation, this engine implements a rigorous **SVI (Stoc
 
 * **Real-time Connection:** Fetches live Option Chain data via Yahoo Finance API.
 * **Smart Cleaning:**
-* **Liquidity Filtering:** Filters quotes based on **Open Interest** and **Volume** to remove stale prices.
-* **Data Hygiene:** Eliminates "dirty data" (e.g., zero-volatility quotes, extreme bid-ask spreads).
-* **Precise Time-Keeping:** Calculates Time-to-Maturity () using trading calendars, handling intraday granularity.
-
-
-* **Yield Curve Bootstrapping:** Dynamically bootstraps the risk-free rate curve () using US Treasury yields (13W, 5Y, 10Y, 30Y) to ensure accurate discounting for long-dated options.
+    * **Liquidity Filtering:** Filters quotes based on **Open Interest** and **Volume** to remove stale prices.
+    * **Data Hygiene:** Eliminates "dirty data" (e.g., zero-volatility quotes, extreme bid-ask spreads).
+    * **Precise Time-Keeping:** Calculates Time-to-Maturity ($T$) using trading calendars, handling intraday granularity.
+* **Yield Curve Bootstrapping:** Dynamically bootstraps the risk-free rate curve ($r(t)$) using US Treasury yields (13W, 5Y, 10Y, 30Y) to ensure accurate discounting for long-dated options.
 
 ### 2. SVI Calibration Engine (`src/svi_model.py`)
 
 The engine fits the **Raw SVI (Stochastic Volatility Inspired)** parameterization to market implied volatilities for each expiration slice.
 
-* **Why SVI?** Unlike cubic splines, SVI guarantees correct asymptotic behavior in the wings (), preventing the "wiggling" that causes massive pricing errors in tail risk products.
+* **Why SVI?** Unlike cubic splines, SVI guarantees correct asymptotic behavior in the wings ($|k| \to \infty$), preventing the "wiggling" that causes massive pricing errors in tail risk products.
 * **The Formula:**
-
-
-
-Where  is total variance, and  is log-moneyness.
+    $$w(k) = a + b \{ \rho (k - m) + \sqrt{(k - m)^2 + \sigma^2} \}$$
+    Where $w(k) = \sigma_{BS}^2 T$ is total variance, and $k$ is log-moneyness.
 * **Constrained Optimization:**
-* **Optimizer:** Uses `SLSQP` (Sequential Least SQuares Programming) with **Multi-Start** heuristics to avoid local minima in highly skewed slices.
-* **Arbitrage Enforcement:** Implements **Penalty Functions** to enforce static no-arbitrage constraints:
-* **Vertical Arbitrage:** , , .
-* **Butterfly Arbitrage:** Enforces strictly positive density ( and convexity checks).
+    * **Optimizer:** Uses `SLSQP` (Sequential Least SQuares Programming) with **Multi-Start** heuristics to avoid local minima in highly skewed slices.
+    * **Arbitrage Enforcement:** Implements **Penalty Functions** to enforce static no-arbitrage constraints (Variance $w > 0$, Slope constraints $|\rho| < 1$).
 
-
-
-
-
-> **Visual Proof:** The model fits the raw market data (red dots) with high precision, ensuring a smooth, arbitrage-free curve (blue line) even in the presence of noise.
-
-> *Figure 1: Real-time SVI model calibration against SPY market data. Note the tight fit in the liquid region and stable extrapolation in the wings.*
+> **Visual Proof:** The model fits the raw market data (red crosses) with high precision, ensuring a smooth, arbitrage-free curve (blue line) even in the presence of noise.
+>
+> ![SVI Calibration Fit](images/svi_calibration_fit.png)
+>
+> *Figure 1: Real-time SVI model calibration against SPY market data (T=0.14 Years). Note the tight fit in the liquid region and stable extrapolation in the wings.*
 
 ### 3. Surface Construction & Local Volatility (`src/vol_surface.py`)
 
-This module transforms the 2D SVI slices into a coherent 3D Implied Volatility Surface and extracts the Local Volatility Surface .
+This module transforms the 2D SVI slices into a coherent 3D Implied Volatility Surface and extracts the Local Volatility Surface $\sigma_{loc}(S,t)$.
 
-* **Coordinate System Transformation (Critical Industry Standard):**
-* Instead of Spot Moneyness (), the engine internally converts all coordinates to **Log-Forward Moneyness**:
-
-
-* **Why?** This absorbs the drift terms (), significantly simplifying Dupire's formula and making the surface invariant to interest rate shifts.
-
-
+* **Coordinate System Transformation :**
+    * Instead of Spot Moneyness ($K/S$), the engine internally converts all coordinates to **Log-Forward Moneyness**:
+        $$y = \ln\left(\frac{K}{F_T}\right) = \ln\left(\frac{K}{S_0 e^{(r-q)T}}\right)$$
+    * **Why?** This absorbs the drift terms ($r-q$), significantly simplifying Dupire's formula and making the surface invariant to interest rate shifts.
 * **Dupire’s Local Volatility:**
-* Implements **Gatheral’s formulation** of Dupire in terms of Total Variance :
+    * Implements **Gatheral’s formulation** of Dupire in terms of Total Variance $w$.
+    * **Numerical Derivatives:** Uses central finite differences on the dense interpolated grid to compute partial derivatives $\frac{\partial w}{\partial T}$ and $\frac{\partial w}{\partial y}$.
 
-
-* **Numerical Derivatives:** Uses central finite differences on the dense interpolated grid to compute partial derivatives  and .
-* **Regularization:** Includes calendar arbitrage checks () and ratio caps to prevent numerical explosions in deep OTM regions.
-
-
-
-> **Topology Comparison:** Notice how the Local Volatility surface (right) exhibits steeper skew and sharper features compared to the smoother Implied Volatility surface (left). This "leverage effect" (volatility increasing as spot drops) is crucial for pricing barriers accurately.
-
-> *Figure 2: 3D Visualization of the Implied Volatility Surface (Left) vs. Dupire Local Volatility Surface (Right).*
+> **Topology Comparison:** While the Implied Volatility surface (left) represents market *expectations*, the Local Volatility surface (right) represents *instantaneous* volatility. Notice how Local Vol exhibits steeper skew and sharper features—this is the "leverage effect" (volatility increasing as spot drops) crucial for pricing barriers accurately.
+>
+> ![Implied vs Local Volatility](images/vol_surface_topology.png)
+>
+> *Figure 2: 3D Visualization showing the structural differences between the smooth Implied Volatility Surface and the resulting Local Volatility Surface.*
 
 ### 4. Exotic Pricing Engine (`src/pricer.py`)
 
 * **Monte Carlo Simulation:** Simulates 50,000+ asset price paths using Geometric Brownian Motion with Local Volatility.
-
-
-* **Sticky Local Volatility:** The pricer performs a vectorized lookup on the pre-computed Local Volatility grid at every time step , ensuring the smile dynamics are respected.
+    $$dS_t = (r_t - q)S_t dt + \sigma_{loc}(S_t, t) S_t dW_t$$
+* **Sticky Local Volatility:** The pricer performs a vectorized lookup on the pre-computed Local Volatility grid at every time step $(S_t, t)$, ensuring the smile dynamics are respected.
 * **Barrier Option Pricing:**
-* Prices **Down-and-Out Call** options.
-* **Model Comparison:** Calculates the spread between the **Local Vol Price** and **Black-Scholes Price**, quantifying the "Model Risk" hidden in flat-volatility assumptions.
-
-
+    * Prices **Down-and-Out Call** options.
+    * **Model Comparison:** Calculates the spread between the **Local Vol Price** and **Black-Scholes Price**, quantifying the "Model Risk" hidden in flat-volatility assumptions.
 
 ### 5. Risk Management & Hedging Analysis
 
-* **Finite Difference Greeks:** Calculates Delta () via "Bump and Revalue" method using **Common Random Numbers (CRN)** to minimize variance.
+* **Finite Difference Greeks:** Calculates Delta ($\Delta$) via "Bump and Revalue" method using **Common Random Numbers (CRN)** to minimize variance.
 * **Delta Skew Profiling:**
-* Visualizes how the hedge ratio changes as the spot price approaches the barrier.
-* **Insight:** Local Volatility models typically suggest a significantly different hedging strategy near barriers compared to Black-Scholes, often requiring larger hedges due to the correlation between Spot and Volatility.
+    * Visualizes how the hedge ratio changes as the spot price approaches the barrier.
 
-
+> **Hedging Insight:** The chart below demonstrates critical Model Risk. As the Spot Price drops towards the Barrier ($583), the **Local Vol Delta (Red)** behaves aggressively, often exceeding 1.0 or dropping sharply due to the volatility spike. A trader hedging with **BS Delta (Gray)** would be significantly under-hedged against the crash risk.
+>
+> ![Delta Skew Analysis](images/delta_skew_profile.png)
+>
+> *Figure 3: Comparison of Hedging Ratios (Delta) between Black-Scholes and Local Volatility models as the asset price approaches the Knock-Out Barrier.*
 
 ### 6. Interactive Dashboard (`app.py`)
 
 * **Tech Stack:** Streamlit + Plotly.
 * **Capabilities:**
-* Real-time 3D surface rotation and inspection.
-* Interactive "Pricing Playground" to test different Strikes, Barriers, and Maturities.
-* Live view of calibration error (RMSE) and arbitrage constraints.
-
-
+    * Real-time 3D surface rotation and inspection.
+    * Interactive "Pricing Playground" to test different Strikes, Barriers, and Maturities.
+    * Live view of calibration error (RMSE) and arbitrage constraints.
 
 ---
 
@@ -110,14 +94,17 @@ This module transforms the 2D SVI slices into a coherent 3D Implied Volatility S
 volatility-surface-modelling/
 ├── src/
 │   ├── __init__.py         # Package initializer
-│   ├── data_loader.py      # ETL: Yahoo Finance API, Cleaning, Yield Curve Bootstrap
+│   ├── data_loader.py      # ETL: Yahoo Finance API, Cleaning, Yield Curve 
 │   ├── rates.py            # RateProvider: US Treasury Interpolation
-│   ├── svi_model.py        # Optimizer: Raw SVI Parametrization & Penalty Functions
-│   ├── vol_surface.py      # Mathematics: Log-Forward Coords, SVI Interpolation, Dupire Formula
-│   └── pricer.py           # Engine: Monte Carlo Simulation & Greeks Calculation
+│   ├── svi_model.py        # Optimizer: Raw SVI Parametrization & Penalty 
+│   ├── vol_surface.py      # Mathematics: Log-Forward Coords, SVI 
+│   └── pricer.py           # Engine: Monte Carlo Simulation & Greeks 
 ├── images/                 # Documentation assets
+│   ├── svi_calibration_fit.png
+│   ├── vol_surface_topology.png
+│   └── delta_skew_profile.png
 ├── app.py                  # Streamlit Frontend Entry Point
-├── demo.ipynb              # Jupyter Notebook for Step-by-Step Research Walkthrough
+├── demo.ipynb              # Jupyter Notebook for Step-by-Step Research 
 ├── requirements.txt        # Python dependencies
 └── README.md               # Documentation
 
@@ -138,14 +125,12 @@ volatility-surface-modelling/
 ```bash
 git clone https://github.com/ericwang0321/volatility-surface-modelling.git
 cd volatility-surface-modelling
-
 ```
 
 
 2. **Install dependencies:**
 ```bash
 pip install -r requirements.txt
-
 ```
 
 
@@ -157,7 +142,6 @@ To explore the data, surfaces, and pricing engine via a web interface:
 
 ```bash
 streamlit run app.py
-
 ```
 
 **Option 2: Jupyter Notebook Walkthrough**
@@ -184,7 +168,7 @@ Implementing Dupire's formula using standard Spot Moneyness () is numerically un
 In Equity markets, the Skew is negative (Spot , Vol ). A simple Black-Scholes model assumes Vol is constant.
 
 * **Scenario:** If SPY drops 10%, a BS model assumes Vol stays at 15%. Our Local Vol model knows (via the surface) that Vol will spike to 25%.
-* **Result:** The Local Vol model assigns a higher probability to hitting the Down-and-Out Barrier, resulting in a **lower** theoretical price for the option compared to BS. This project empirically proves this behavior.
+* **Result:** The Local Vol model assigns a higher probability to hitting the Down-and-Out Barrier, resulting in a **lower** theoretical price for the option compared to BS. This project empirically proves this behavior and visualizes the resulting **Delta Skew**.
 
 ---
 
