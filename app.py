@@ -10,6 +10,14 @@ st.set_page_config(page_title="Quant Volatility Surface", layout="wide")
 # Title and Description
 st.title("📈 Industrial Volatility Surface & Pricing Engine")
 
+# --- Helper Class for UI Compatibility ---
+class SimpleRateProvider:
+    """Helper to wrap the UI's manual interest rate input into a provider object."""
+    def __init__(self, r):
+        self.r = r
+    def get_risk_free_rate(self, T):
+        return self.r
+
 # --- 1. Sidebar Configuration & Navigation ---
 st.sidebar.header("Global Settings")
 ticker = st.sidebar.text_input("Ticker Symbol", value="SPY")
@@ -18,7 +26,6 @@ build_btn = st.sidebar.button("Build Surface 🚀")
 st.sidebar.markdown("---")
 
 # Navigation Menu
-# Added "Hedging & Greeks Analysis" as Module 3
 nav_option = st.sidebar.radio(
     "Select Module", 
     [
@@ -31,10 +38,13 @@ nav_option = st.sidebar.radio(
 )
 
 # --- 2. State Management ---
-# Build Surface and persist in session_state
 if build_btn:
     with st.spinner(f"Fetching data and calibrating models for {ticker}..."):
         try:
+            # Re-initialize
+            if 'vol_surface_obj' in st.session_state:
+                del st.session_state['vol_surface_obj']
+            
             surface = VolatilitySurface(ticker)
             surface.build()
             st.session_state['vol_surface_obj'] = surface
@@ -55,23 +65,31 @@ if 'vol_surface_obj' in st.session_state:
         st.subheader("Implied vs. Local Volatility Topology")
         
         # Get Grid
-        X, Y, Z_imp, Z_loc = surface.get_mesh_grid()
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.caption("Market Implied Volatility (Expectation)")
-            fig_imp = go.Figure(data=[go.Surface(z=Z_imp, x=X, y=Y, colorscale='Viridis')])
-            fig_imp.update_layout(scene=dict(xaxis_title='Moneyness', yaxis_title='Time', zaxis_title='Vol'), 
-                                margin=dict(l=10, r=10, b=10, t=10), height=500)
-            st.plotly_chart(fig_imp, use_container_width=True)
+        # vol_surface.py updated to return X (Spot Moneyness), Y (Time), Z_imp, Z_loc
+        try:
+            X, Y, Z_imp, Z_loc = surface.get_mesh_grid()
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.caption("Market Implied Volatility (Expectation)")
+                fig_imp = go.Figure(data=[go.Surface(z=Z_imp, x=X, y=Y, colorscale='Viridis')])
+                fig_imp.update_layout(
+                    scene=dict(xaxis_title='Moneyness (Spot/Strike)', yaxis_title='Time', zaxis_title='Vol'), 
+                    margin=dict(l=10, r=10, b=10, t=10), height=500
+                )
+                st.plotly_chart(fig_imp, use_container_width=True)
 
-        with col2:
-            st.caption("Dupire Local Volatility (Pricing Input)")
-            fig_loc = go.Figure(data=[go.Surface(z=Z_loc, x=X, y=Y, colorscale='Turbo')])
-            fig_loc.update_layout(scene=dict(xaxis_title='Spot/Strike', yaxis_title='Time', zaxis_title='Loc Vol'), 
-                                margin=dict(l=10, r=10, b=10, t=10), height=500)
-            st.plotly_chart(fig_loc, use_container_width=True)
+            with col2:
+                st.caption("Dupire Local Volatility (Pricing Input)")
+                fig_loc = go.Figure(data=[go.Surface(z=Z_loc, x=X, y=Y, colorscale='Turbo')])
+                fig_loc.update_layout(
+                    scene=dict(xaxis_title='Moneyness (Spot/Strike)', yaxis_title='Time', zaxis_title='Loc Vol'), 
+                    margin=dict(l=10, r=10, b=10, t=10), height=500
+                )
+                st.plotly_chart(fig_loc, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error generating surface: {e}")
 
     # ---------------------------------------------------------
     # Module 2: Exotic Pricing Engine
@@ -92,20 +110,33 @@ if 'vol_surface_obj' in st.session_state:
             barrier = st.number_input("Barrier Level (Knock-out)", value=float(int(S0 * 0.85)))
             
         with col_p3:
-            r_rate = st.number_input("Risk Free Rate", value=0.045)
-            n_sims = st.slider("Monte Carlo Paths", 1000, 10000, 2000)
+            # User Manual Override for Rate
+            r_rate = st.number_input("Risk Free Rate (Manual Override)", value=0.045, format="%.4f")
+            n_sims = st.slider("Monte Carlo Paths", 1000, 50000, 10000)
 
         # Run Button
         if st.button("Run Monte Carlo Simulation 🎲"):
-            pricer = MonteCarloPricer(S0, r_rate, T_years, surface)
+            # Prepare dependencies for updated Pricer signature
+            # Signature: (S0, T, rate_provider, q, vol_surface)
+            manual_rate_provider = SimpleRateProvider(r_rate)
+            q_yield = surface.dividend_yield
+            
+            pricer = MonteCarloPricer(S0, T_years, manual_rate_provider, q_yield, surface)
             
             with st.spinner("Simulating paths... (This uses Local Vol surface lookup)"):
                 # 1. Benchmark BS
+                # Note: get_implied_vol inputs are (log_spot_moneyness, T)
+                # ATM => Strike=Spot => log(1) = 0
                 atm_vol = surface.get_implied_vol(0, T_years)
-                res_bs = pricer.price_barrier_option(strike, barrier, model="black_scholes", const_vol=atm_vol, n_paths=n_sims)
+                
+                res_bs = pricer.price_barrier_option(
+                    strike, barrier, model="black_scholes", const_vol=atm_vol, n_paths=n_sims
+                )
                 
                 # 2. Local Vol
-                res_lv = pricer.price_barrier_option(strike, barrier, model="local_vol", n_paths=n_sims)
+                res_lv = pricer.price_barrier_option(
+                    strike, barrier, model="local_vol", n_paths=n_sims
+                )
                 
                 # Store results in session state
                 st.session_state['pricing_res'] = (res_bs, res_lv, atm_vol)
@@ -120,23 +151,25 @@ if 'vol_surface_obj' in st.session_state:
             c2.metric("Black-Scholes Price", f"${res_bs['price']:.2f}")
             
             diff = res_lv['price'] - res_bs['price']
-            color = "normal" if diff < 0 else "inverse"
-            c3.metric("Local Vol Price", f"${res_lv['price']:.2f}", delta=f"{diff:.2f}", delta_color=color)
+            # If LV < BS (negative diff), that's expected for Down-and-Out + Negative Skew
+            # We color it green (normal) if it drops, or inverse logic depending on preference.
+            c3.metric("Local Vol Price", f"${res_lv['price']:.2f}", delta=f"{diff:.2f}")
 
             st.info("💡 **Model Risk Analysis:**")
             if res_lv['price'] < res_bs['price']:
                 st.markdown(f"""
-                **Result: Local Vol < Black-Scholes.** This is the classic "Skew Effect".
-                The model sees higher volatility on the downside (near the barrier), increasing the knock-out probability.
+                **Result: Local Vol < Black-Scholes.** This aligns with the **Negative Skew** of Equity markets.
+                
+                * **Why?** The Local Volatility surface captures that volatility *increases* as the price drops towards the barrier.
+                * **Impact:** Higher volatility on the downside = Higher probability of hitting the barrier = Lower probability of survival = **Lower Price**.
                 """)
             else:
                 st.markdown(f"""
-                **Result: Local Vol > Black-Scholes.** This indicates "Vega Dominance".
-                The volatility along the survival paths is high enough to compensate for the barrier risk.
+                **Result: Local Vol > Black-Scholes.** This might occur if the barrier is very deep OTM or the volatility surface has a different shape (e.g., inverted skew).
                 """)
 
     # ---------------------------------------------------------
-    # Module 3: Hedging & Greeks Analysis (NEW)
+    # Module 3: Hedging & Greeks Analysis
     # ---------------------------------------------------------
     elif nav_option == "3. Hedging & Greeks Analysis":
         st.subheader("🛡️ Hedge Effectiveness Analysis (Delta Profile)")
@@ -153,32 +186,33 @@ if 'vol_surface_obj' in st.session_state:
             strike_level = st.number_input("Strike Price", value=float(int(S_current * 1.05)), key="h_str")
         with col_h2:
             T_hedge = st.number_input("Time to Mat", value=1.0, key="h_t")
-            n_sims_hedge = st.slider("Simulations per Point", 500, 5000, 2000, key="h_sims")
+            n_sims_hedge = st.slider("Simulations per Point", 1000, 20000, 5000, key="h_sims")
             
         if st.button("Calculate Delta Profile 📉"):
-            # Progress bar for UX
             progress_bar = st.progress(0)
             status_text = st.empty()
             
-            # Generate Spot Range (From 95% of Barrier to 110% of Spot)
+            # Range: From below Barrier to ITM
             spot_range = np.linspace(barrier_level * 0.95, S_current * 1.1, 15)
             
             bs_deltas = []
             lv_deltas = []
             
-            # Use a fixed ATM vol for BS comparison
-            atm_vol_fixed = surface.get_implied_vol(0, T_hedge)
+            # Use surface dividend yield
+            q_yield = surface.dividend_yield
+            # Use internal rate provider from surface for consistency in hedging module
+            # (Or could use manual input if desired)
+            rate_provider = surface.rate_provider
             
             try:
                 for i, s_val in enumerate(spot_range):
                     status_text.text(f"Calculating Delta for Spot Price ${s_val:.2f}...")
                     
                     # Create temporary pricer at hypothetical spot s_val
-                    # r is fixed at 0.045 for simplicity or fetch from rates
-                    temp_pricer = MonteCarloPricer(s_val, 0.045, T_hedge, surface)
+                    # Updated Signature: (S0, T, rate_provider, q, vol_surface)
+                    temp_pricer = MonteCarloPricer(s_val, T_hedge, rate_provider, q_yield, surface)
                     
                     # 1. BS Delta
-                    # Note: We assume pricer.calculate_delta uses the barrier option logic
                     d_bs = temp_pricer.calculate_delta(
                         strike_level, barrier_level, 
                         model="black_scholes", 
@@ -194,7 +228,6 @@ if 'vol_surface_obj' in st.session_state:
                     )
                     lv_deltas.append(d_lv)
                     
-                    # Update progress
                     progress_bar.progress((i + 1) / len(spot_range))
                 
                 status_text.text("Calculation Complete!")
@@ -202,25 +235,22 @@ if 'vol_surface_obj' in st.session_state:
                 # Plotting
                 fig_delta = go.Figure()
                 
-                # BS Line
                 fig_delta.add_trace(go.Scatter(
                     x=spot_range, y=bs_deltas, 
-                    mode='lines+markers', name='Black-Scholes Delta', 
+                    mode='lines+markers', name='BS Delta', 
                     line=dict(color='gray', dash='dash')
                 ))
                 
-                # Local Vol Line
                 fig_delta.add_trace(go.Scatter(
                     x=spot_range, y=lv_deltas, 
                     mode='lines+markers', name='Local Vol Delta', 
                     line=dict(color='red', width=3)
                 ))
                 
-                # Add Barrier Line
                 fig_delta.add_vline(x=barrier_level, line_width=2, line_dash="dot", line_color="black", annotation_text="Barrier")
                 
                 fig_delta.update_layout(
-                    title="Delta Profile: Hedging Ratio vs. Spot Price",
+                    title=f"Delta Skew: Hedging Ratio vs. Spot Price (N_SIMS={n_sims_hedge})",
                     xaxis_title="Spot Price",
                     yaxis_title="Option Delta",
                     hovermode="x unified",
@@ -230,38 +260,57 @@ if 'vol_surface_obj' in st.session_state:
                 
                 st.info("""
                 **Quant Insight:**
-                Observe the behavior near the **Barrier (Black Line)**. 
-                * **Local Vol Delta** often drops faster or behaves more aggressively because the model anticipates the volatility spike associated with the crash risk.
-                * Relying on the Gray Line (BS) for hedging could lead to significant under-hedging in a sell-off scenario.
+                The **Local Vol Delta (Red)** behaves drastically differently near the barrier compared to BS.
+                This is due to the **Vega-Spot Cross Gamma**: As Spot drops, Vol rises (Skew), which makes the option price drop even faster (or recover slower), changing the hedge ratio dynamically.
                 """)
                 
-            except AttributeError:
-                st.error("Error: `calculate_delta` method not found in `MonteCarloPricer`. Please ensure `src/pricer.py` is updated.")
             except Exception as e:
                 st.error(f"An error occurred during calculation: {e}")
+                import traceback
+                st.text(traceback.format_exc())
 
     # ---------------------------------------------------------
     # Module 4: Smile Calibration
     # ---------------------------------------------------------
     elif nav_option == "4. Smile Calibration":
         st.subheader("SVI Fit Inspection")
-        available_expiries = sorted(surface.svi_params.keys())
-        if available_expiries:
+        if not surface.svi_params:
+            st.warning("No calibration data available.")
+        else:
+            available_expiries = sorted(surface.svi_params.keys())
             selected_T = st.selectbox("Select Expiration (Years)", available_expiries)
+            
             if selected_T:
                 slice_data = surface.raw_data[surface.raw_data['T'] == selected_T]
-                k_market = np.log(slice_data['moneyness'])
-                vol_market = slice_data['impliedVolatility']
                 
-                k_grid = np.linspace(k_market.min()-0.1, k_market.max()+0.1, 100)
-                vol_model = [surface.get_implied_vol(k, selected_T) for k in k_grid]
-                m_grid = np.exp(k_grid)
-                
-                fig_2d = go.Figure()
-                fig_2d.add_trace(go.Scatter(x=slice_data['moneyness'], y=vol_market, mode='markers', name='Market Data', marker=dict(color='red', size=8)))
-                fig_2d.add_trace(go.Scatter(x=m_grid, y=vol_model, mode='lines', name='SVI Model', line=dict(color='blue')))
-                fig_2d.update_layout(title=f"Smile at T={selected_T:.4f}", xaxis_title="Moneyness", yaxis_title="Implied Vol")
-                st.plotly_chart(fig_2d, use_container_width=True)
+                if slice_data.empty:
+                    st.warning("No raw data found for this slice (cleaning filter?).")
+                else:
+                    k_market = np.log(slice_data['moneyness'])
+                    vol_market = slice_data['impliedVolatility']
+                    
+                    # Generate SVI Curve
+                    k_grid = np.linspace(k_market.min()-0.1, k_market.max()+0.1, 100)
+                    
+                    # Use the updated get_implied_vol which expects log-spot-moneyness
+                    vol_model = [surface.get_implied_vol(k, selected_T) for k in k_grid]
+                    m_grid = np.exp(k_grid) # Back to Strike/Spot
+                    
+                    fig_2d = go.Figure()
+                    fig_2d.add_trace(go.Scatter(x=slice_data['moneyness'], y=vol_market, mode='markers', name='Market Data', marker=dict(color='red', size=8, symbol='x')))
+                    fig_2d.add_trace(go.Scatter(x=m_grid, y=vol_model, mode='lines', name='SVI Model', line=dict(color='blue', width=3)))
+                    
+                    fig_2d.update_layout(
+                        title=f"SVI Calibration: {ticker} (T={selected_T:.2f} Years)", 
+                        xaxis_title="Moneyness (Strike / Spot)", 
+                        yaxis_title="Implied Volatility",
+                        template="plotly_white"
+                    )
+                    st.plotly_chart(fig_2d, use_container_width=True)
+                    
+                    # Show Params
+                    params = surface.svi_params[selected_T]
+                    st.json(params)
 
     # ---------------------------------------------------------
     # Module 5: Raw Data
