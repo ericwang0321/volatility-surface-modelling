@@ -6,67 +6,100 @@ from scipy.interpolate import RegularGridInterpolator
 
 from src.svi_model import SVIModel
 from src.data_loader import DataLoader
-from src.rates import RateProvider  # Need rates internally for conversion
+from src.rates import RateProvider
 
 # Configure logger
 logger = logging.getLogger(__name__)
 
 class VolatilitySurface:
     """
-    Constructs the Volatility Surface and extracts Local Volatility using 
-    Log-Forward Moneyness based Dupire Formula for stability.
+    Constructs the Volatility Surface and extracts Local Volatility.
+    
+    MAJOR UPDATE:
+    - Now uses **Log-Forward Moneyness** (y = log(K/F)) instead of Spot Moneyness.
+    - This simplifies Dupire's formula (drift term cancels out) and aligns with industry standards.
     """
 
     def __init__(self, ticker: str = "SPY"):
         self.ticker = ticker
         self.data_loader = DataLoader(ticker)
-        self.rate_provider = RateProvider() # Internal rate provider
+        self.rate_provider = RateProvider() 
         self.svi_params = {} 
         self.spot_price = None
         self.dividend_yield = 0.0
         self.raw_data = None
         
-        self.moneyness_grid = np.linspace(0.8, 1.2, 50)
+        # Grid settings for surface generation
+        # NOTE: Grid now represents Log-Forward Moneyness, centered around 0 (ATM)
+        # e.g., -0.2 to +0.2 roughly corresponds to 80% to 120% Forward Moneyness
+        self.moneyness_grid = np.linspace(np.log(0.8), np.log(1.2), 50) 
         self.time_grid = None 
 
+        # Interpolator for Local Volatility
         self.interpolator = None
         self.interp_s_grid = None
         self.interp_t_grid = None
 
     def build(self):
         """
-        Main pipeline: Fetches data, calibrates SVI for each slice.
+        Main pipeline: Fetches data, converts to Forward coordinates, calibrates SVI.
         """
+        # Fetch Data
         self.raw_data = self.data_loader.fetch_options_chain()
         self.spot_price = self.data_loader.spot_price
         self.dividend_yield = self.data_loader.fetch_dividend_yield()
         
+        # Identify unique expirations
         expirations = sorted(self.raw_data['expirationDate'].unique())
         self.time_grid = []
 
-        logger.info(f"Building Vol Surface for {self.ticker} across {len(expirations)} expiries.")
+        logger.info(f"Building Vol Surface for {self.ticker} (Log-Forward) across {len(expirations)} expiries.")
+
+        prev_w_atm = -1.0
 
         for exp in expirations:
             df_slice = self.raw_data[self.raw_data['expirationDate'] == exp]
-            if len(df_slice) < 5: continue
+            if len(df_slice) < 5: 
+                continue
 
             T = df_slice['T'].iloc[0]
-            # SVI Calibration is done on Log-Moneyness k = log(K/S)
-            k_data = np.log(df_slice['moneyness']).values
+            if T < 0.002: continue
+
+            # --- COORDINATE TRANSFORMATION ---
+            # 1. Get Rates & Dividend
+            r = self.rate_provider.get_risk_free_rate(T)
+            q = self.dividend_yield
+            
+            # 2. Calculate Log-Spot Moneyness k_spot = log(K/S)
+            k_spot = np.log(df_slice['moneyness']).values
+            
+            # 3. Convert to Log-Forward Moneyness y = log(K/F)
+            # F = S * exp((r-q)T)  =>  log(K/F) = log(K/S) - (r-q)T
+            y_data = k_spot - (r - q) * T
+            
             w_data = ((df_slice['impliedVolatility'] ** 2) * T).values
             
+            # Calibrate SVI on y (Log-Forward)
             svi = SVIModel()
-            params = svi.calibrate(k_data, w_data)
+            params = svi.calibrate(y_data, w_data)
             
             if params and params['success']:
+                # Calendar Arb Check (at ATM Forward, y=0)
+                current_w_atm = svi.raw_svi_formula(0, params['a'], params['b'], params['rho'], params['m'], params['sigma'])
+                
+                if prev_w_atm > 0 and current_w_atm < prev_w_atm:
+                    logger.warning(f"Potential Calendar Arbitrage at T={T:.4f}. Variance decreased. Skipping.")
+                    continue
+                
                 self.svi_params[T] = params
                 self.time_grid.append(T)
+                prev_w_atm = current_w_atm
 
         logger.info(f"Surface built. Calibrated {len(self.svi_params)} slices.")
 
     def build_local_vol_interpolator(self, s_steps: int = 100, t_steps: int = 50):
         """
-        Pre-computes Local Volatility on a dense grid.
+        Pre-computes Local Volatility on a dense grid for fast lookup.
         """
         if not self.svi_params:
             self.build()
@@ -98,9 +131,11 @@ class VolatilitySurface:
             self.build_local_vol_interpolator()
         return self.interpolator(points)
 
-    def get_implied_vol(self, k: float, T: float) -> float:
+    def get_implied_vol(self, k_spot: float, T: float) -> float:
         """
-        Returns Implied Volatility for log-moneyness k = log(K/S) and time T.
+        Returns Implied Volatility.
+        NOTE: Input `k_spot` is still log(Strike/Spot) for compatibility with external callers.
+        We convert it to log-forward `y` internally.
         """
         if not self.svi_params:
             raise ValueError("Surface not built.")
@@ -108,163 +143,156 @@ class VolatilitySurface:
         sorted_times = sorted(self.svi_params.keys())
         T_clamped = max(sorted_times[0], min(T, sorted_times[-1]))
         
-        if T_clamped in self.svi_params:
-            return self._get_slice_vol(k, T_clamped)
+        # Convert Spot Moneyness -> Forward Moneyness
+        r = self.rate_provider.get_risk_free_rate(T_clamped)
+        q = self.dividend_yield
+        y = k_spot - (r - q) * T_clamped
 
-        # Linear Interpolation of Variance
+        # Exact match
+        if T_clamped in self.svi_params:
+            return self._get_slice_vol(y, T_clamped)
+
+        # Interpolation
         idx = np.searchsorted(sorted_times, T_clamped)
         t_lower = sorted_times[idx - 1]
         t_upper = sorted_times[idx]
         
-        w_lower = (self._get_slice_vol(k, t_lower) ** 2) * t_lower
-        w_upper = (self._get_slice_vol(k, t_upper) ** 2) * t_upper
+        # We need to re-calculate y for lower/upper T because forward price changes with T!
+        r_lower = self.rate_provider.get_risk_free_rate(t_lower)
+        y_lower = k_spot - (r_lower - q) * t_lower
         
+        r_upper = self.rate_provider.get_risk_free_rate(t_upper)
+        y_upper = k_spot - (r_upper - q) * t_upper
+        
+        w_lower = (self._get_slice_vol(y_lower, t_lower) ** 2) * t_lower
+        w_upper = (self._get_slice_vol(y_upper, t_upper) ** 2) * t_upper
+        
+        # Calendar Arb clamp
+        if w_upper < w_lower: w_upper = w_lower
+
         ratio = (T_clamped - t_lower) / (t_upper - t_lower)
         w_target = w_lower + ratio * (w_upper - w_lower)
         
         if w_target < 1e-6: w_target = 1e-6
         return np.sqrt(w_target / T_clamped)
 
-    def _get_slice_vol(self, k: float, T: float) -> float:
+    def _get_slice_vol(self, y: float, T: float) -> float:
+        """y is Log-Forward Moneyness here."""
         params = self.svi_params[T]
-        svi = SVIModel()
-        svi.params = [params['a'], params['b'], params['rho'], params['m'], params['sigma']]
-        return svi.get_vol(k, T)
+        return SVIModel.raw_svi_formula_vol(y, params['a'], params['b'], params['rho'], params['m'], params['sigma'], T)
 
     def get_local_vol(self, S_t: float, t: float) -> float:
         """
-        Calculates Local Volatility using the Log-Forward Moneyness formulation.
-        This is much more stable when rates are non-zero.
+        Calculates Local Volatility using Dupire's Formula in Log-Forward coordinates.
         
-        Formula:
+        Formula (Log-Forward y):
         sigma_loc^2 = (dw/dT) / (1 - y/w * dw/dy + 0.25(-0.25 - 1/w + y^2/w^2)(dw/dy)^2 + 0.5 d2w/dy2)
-        where y is log-forward-moneyness: y = log(K/F_T) = log(K/S) - (r-q)T
         
-        Wait! SVI is calibrated on x = log(K/S).
-        We need to be careful with coordinate transformation.
-        
-        Let's stick to the Spot-based Dupire but with corrected drift handling.
+        Key Advantage: The drift term (r-q) * dw/dk is ABSORBED into the coordinate system.
+        Numerator is simply dw/dT.
         """
         if t < 0.002: t = 0.002
-        if S_t <= 1.0: S_t = 1.0
+        if S_t <= 1e-3: S_t = 1e-3
         
-        # 1. Get Market Parameters for this T
+        # 1. Coordinate Prep
         r = self.rate_provider.get_risk_free_rate(t)
         q = self.dividend_yield
         
-        # 2. Calculate Log-Moneyness k = log(S/K) -> Wait, SVI uses log(K/S) or log(S/K)? 
-        # In SVI code: k = log(Strike/Spot). 
-        # So for a given Spot S_t and implied Strike K=S_t (ATM), k = 0.
-        # But we need to find Local Vol at Spot S_t.
-        # This implies we are looking at an option with Strike K = S_t (conceptually).
-        
-        # Let's use the standard "Strike-based" Dupire formula components.
-        # We need local vol at (S_t, t). This corresponds to Strike K = S_t.
-        # So log-moneyness x = log(K/S_0) where S_0 is initial spot? 
-        # No, Local Vol is state dependent.
-        
-        # Let's simplify: We use the definition of Implied Vol Surface w(k, t)
-        # where k = log(S_t / S_current_spot).
-        
-        # Current Spot (from data loader, fixed constant S0)
+        # Initial Spot S0 (Surface Base)
         S0 = self.spot_price 
         
-        # The 'k' for SVI is log(K / S0). 
-        # To evaluate Local Vol at price level S_t, we treat S_t as the Strike K.
-        # Why? Because Dupire equation relates Local Vol at (K, T) to Call Prices C(K, T).
-        # So: sigma_loc(K, T) is what we calculate.
-        # Here, the input variable is S_t (the simulated price path), which acts as the 'Strike' K in the formula.
-        
+        # We need Local Vol at Strike K = S_t
         K_equiv = S_t
-        k_svi = np.log(K_equiv / S0) # This is the k to query SVI
         
-        # 1. Get Implied Vol and Total Variance w
-        imp_vol = self.get_implied_vol(k_svi, t)
-        w = (imp_vol ** 2) * t
+        # Log-Forward Moneyness y = log(K / F_t)
+        # F_t = S0 * exp((r-q)t)
+        # y = log(K / S0) - (r-q)t
+        k_spot = np.log(K_equiv / S0)
+        y = k_spot - (r - q) * t
         
-        # 2. Finite Differences for Derivatives
-        dt = 0.01
-        dk = 0.01
-        
-        # Helper for w(k, t)
-        def calc_w(k_in, t_in):
+        # 2. Helper for Total Variance w(y, t)
+        def get_w(y_in, t_in):
             t_in = max(1e-4, t_in)
-            v = self.get_implied_vol(k_in, t_in)
-            return (v**2) * t_in
+            # Need to handle y -> vol conversion carefully during finite difference
+            # SVI is calibrated on y, so we can call _get_slice_vol directly IF t_in is an exact slice.
+            # But t_in is continuous (t + dt). So we use get_implied_vol logic but tailored for y input?
+            # Actually, our get_implied_vol takes k_spot.
+            # Let's reverse engineer k_spot for the helper to reuse logic.
             
-        dw_dt = (calc_w(k_svi, t + dt) - calc_w(k_svi, t - dt)) / (2 * dt)
-        dw_dk = (calc_w(k_svi + dk, t) - calc_w(k_svi - dk, t)) / (2 * dk)
-        d2w_dk2 = (calc_w(k_svi + dk, t) - 2*w + calc_w(k_svi - dk, t)) / (dk**2)
+            # y_in = k_spot_in - (r-q)t_in
+            # k_spot_in = y_in + (r-q)t_in
+            # This keeps the abstraction consistent.
+            r_in = self.rate_provider.get_risk_free_rate(t_in)
+            k_spot_temp = y_in + (r_in - q) * t_in
+            
+            vol = self.get_implied_vol(k_spot_temp, t_in)
+            return (vol ** 2) * t_in
+
+        # 3. Finite Differences
+        dt = 0.005
+        dy = 0.01 
         
-        # 3. Dupire Formula (in terms of log-moneyness k = log(K/S0))
-        # The drift term (r-q) MUST be included in the denominator for correct skew handling
-        # Denom = 1 - (k/w)*dw_dk + ... is wrong if k is not log-forward.
+        w = get_w(y, t)
+        imp_vol = np.sqrt(w / t)
         
-        # Let's use the robust form developed by Gatheral (The SVI creator):
-        # sigma_loc^2 = (dw/dt) / (1 - y/w dw/dy + ...) is hard because we calibrated on Spot Moneyness.
+        # Time Derivative (Numerator) - No Drift Term needed!
+        w_t_plus = get_w(y, t + dt)
+        w_t_minus = get_w(y, t - dt)
+        dw_dt = (w_t_plus - w_t_minus) / (2 * dt)
         
-        # Alternative: Use the "Raw" Dupire Formula directly on Call Prices? No, too slow.
-        # Let's use the formulation for x = log(K/S):
+        # Moneyness Derivatives (Denominator)
+        w_y_plus = get_w(y + dy, t)
+        w_y_minus = get_w(y - dy, t)
+        dw_dy = (w_y_plus - w_y_minus) / (2 * dy)
         
-        # drift term adjustment
-        mu = r - q
+        d2w_dy2 = (w_y_plus - 2*w + w_y_minus) / (dy**2)
         
-        # Numerator: dw/dt + (r-q) * dw/dk 
-        # This correction aligns the time-decay with the drift of the asset!
-        numerator = dw_dt #+ mu * dw_dk  <-- actually, standard implementation often omits this if calibrated on forward.
-        # But we calibrated on Spot.
+        # 4. Dupire Formula (Gatheral's Forward Form)
+        numerator = dw_dt 
         
-        # Let's stick to the most stable implementation:
-        # We clamp the output relative to Implied Vol.
-        
-        # The main issue in your previous plot was the NEGATIVE Delta.
-        # This implies Local Vol was becoming HUGE (like 1000%).
-        
-        # Recalculate Denominator
-        # y = k_svi (log strike/spot)
-        y = k_svi
-        
-        term1 = 1 - (y/w) * dw_dk
-        term2 = 0.25 * (-0.25 - 1/w + (y/w)**2) * (dw_dk**2)
-        term3 = 0.5 * d2w_dk2
+        term1 = 1 - (y / w) * dw_dy
+        term2 = 0.25 * (-0.25 - (1/w) + (y/w)**2) * (dw_dy**2)
+        term3 = 0.5 * d2w_dy2
         
         denominator = term1 + term2 + term3
         
-        # --- SANITIZATION ---
-        
-        # 1. Prevent Time Arbitrage
-        if dw_dt < 1e-5: dw_dt = 1e-5
+        # 5. Stability & Clamping
+        if numerator < 1e-6: numerator = 1e-6
+        if denominator < 1e-6: denominator = 1e-6
             
-        # 2. Prevent Density Arbitrage
-        if denominator < 1e-2: denominator = 1e-2
-            
-        # 3. Compute Var
-        var_loc = dw_dt / denominator
+        var_loc = numerator / denominator
         
-        # 4. CRITICAL: The "Ratio Cap"
-        # Industry standard: Local Vol shouldn't exceed 1.5x to 2.0x Implied Vol 
-        # unless in extreme distress. For SPY, 1.5x is a safe upper bound.
-        
+        if var_loc < 0: var_loc = 0
         vol_loc = np.sqrt(var_loc)
         
-        if vol_loc > imp_vol * 1.5:
-            vol_loc = imp_vol * 1.5
-        if vol_loc < imp_vol * 0.5:
-            vol_loc = imp_vol * 0.5
+        # Ratio Cap
+        if vol_loc > imp_vol * 2.5: vol_loc = imp_vol * 2.5
+        if vol_loc < imp_vol * 0.2: vol_loc = imp_vol * 0.2
             
         return vol_loc
 
     def get_mesh_grid(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Generates grid data for plotting.
+        Converts internal Log-Forward y back to Spot Moneyness M = K/S for intuitive plotting.
+        """
         if not self.time_grid: self.build()
         valid_times = sorted([t for t in self.svi_params.keys() if t > 0.05])
-        X, Y = np.meshgrid(self.moneyness_grid, valid_times)
+        
+        # Plotting grid in Spot Moneyness (e.g. 0.8 to 1.2)
+        spot_moneyness_plot = np.linspace(0.8, 1.2, 50)
+        
+        X, Y = np.meshgrid(spot_moneyness_plot, valid_times)
         Z_imp = np.zeros_like(X)
         Z_loc = np.zeros_like(X)
         
         for i, t in enumerate(valid_times):
-            for j, m_val in enumerate(self.moneyness_grid):
-                k = np.log(m_val)
+            for j, m_val in enumerate(spot_moneyness_plot):
+                # k_spot = log(m_val)
+                k_spot = np.log(m_val)
                 S_eq = self.spot_price * m_val
-                Z_imp[i, j] = self.get_implied_vol(k, t)
+                
+                Z_imp[i, j] = self.get_implied_vol(k_spot, t)
                 Z_loc[i, j] = self.get_local_vol(S_eq, t)
+        
         return X, Y, Z_imp, Z_loc

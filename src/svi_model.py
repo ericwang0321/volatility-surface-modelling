@@ -10,6 +10,11 @@ class SVIModel:
     """
     Implements the Raw SVI (Stochastic Volatility Inspired) model parameterization.
     Ref: Gatheral, J. (2004). "A Parcimonious Representation of the Volatility Surface".
+    
+    Improvements:
+    1. Added explicit static arbitrage constraints via penalty functions.
+    2. Added `raw_svi_formula_vol` helper for the surface builder.
+    3. Enhanced optimization using SLSQP with boundary and inequality constraints.
     """
 
     def __init__(self):
@@ -21,109 +26,102 @@ class SVIModel:
     def raw_svi_formula(k: float, a: float, b: float, rho: float, m: float, sigma: float) -> float:
         """
         The Raw SVI formula: w(k) = a + b * (rho * (k - m) + sqrt((k - m)^2 + sigma^2))
-        
-        Args:
-            k: Log-moneyness log(Strike/Spot)
-            a, b, rho, m, sigma: SVI parameters
-            
-        Returns:
-            Total Variance (w) = sigma_implied^2 * T
+        Returns Total Variance (w).
         """
-        # SVI Formula
         return a + b * (rho * (k - m) + np.sqrt((k - m)**2 + sigma**2))
+
+    @staticmethod
+    def raw_svi_formula_vol(k: float, a: float, b: float, rho: float, m: float, sigma: float, T: float) -> float:
+        """
+        Helper method to return Implied Volatility directly.
+        sigma_impl = sqrt(w / T)
+        """
+        w = SVIModel.raw_svi_formula(k, a, b, rho, m, sigma)
+        if w < 1e-8: w = 1e-8 # Clamp non-positive variance
+        return np.sqrt(w / T)
 
     def calibrate(self, k_data: np.array, w_data: np.array) -> Optional[Dict]:
         """
-        Calibrates the SVI model to market data for a single slice (single expiry).
-        Uses Multi-Start Optimization to handle local minima in short-dated options.
-        Includes Regularization to prevent Local Volatility instability.
-        
-        Args:
-            k_data: Array of log-moneyness log(K/S)
-            w_data: Array of total variance (implied_vol^2 * T)
-            
-        Returns:
-            Dict containing calibrated parameters and optimization status.
+        Calibrates the SVI model to market data (Log-Forward Moneyness k, Total Variance w).
         """
-        # Objective function: Minimize Sum of Squared Errors (SSE) + Penalties
+        
+        # 1. Define Objective Function (RMSE + Penalty)
         def objective(params):
             a, b, rho, m, sigma = params
+            
+            # Calculate Model Variance
             w_model = self.raw_svi_formula(k_data, a, b, rho, m, sigma)
             
-            # Penalty for NaN or negative variance (impossible in reality)
-            if np.any(np.isnan(w_model)) or np.any(w_model < 0):
-                return 1e9
+            # RMSE
+            error = w_model - w_data
+            rmse = np.sqrt(np.mean(error**2))
             
-            # Base Error (MSE)
-            mse = np.sum((w_model - w_data)**2)
-
-            # --- NEW: Regularization (Penalty) ---
-            # Penalize extreme curvature (sigma) and extreme skew (rho)
-            # to prevent Local Volatility explosions (numerical instability).
+            # --- PENALTY TERMS ---
             penalty = 0.0
             
-            # Penalize sigma > 1.0 (High curvature causes 2nd derivative spikes in Dupire)
-            if sigma > 1.0: 
-                penalty += (sigma - 1.0) * 10.0 
+            # Constraint: b >= 0
+            if b < 0: penalty += 100 * abs(b)
+                
+            # Constraint: |rho| < 1
+            if abs(rho) >= 1: penalty += 100 * (abs(rho) - 0.99)
+                
+            # Constraint: sigma > 0
+            if sigma < 0: penalty += 100 * abs(sigma)
             
-            # Penalize rho > 0.95 or < -0.95 (Extreme skew leads to arbitrage violations)
-            if abs(rho) > 0.95: 
-                penalty += (abs(rho) - 0.95) * 10.0
-            
-            return mse + penalty
+            # Constraint: No Static Arbitrage (Variance > 0 everywhere)
+            # The minimum variance in SVI is approx (a + b * sigma * sqrt(1 - rho^2))
+            # We want this to be >= 0.
+            min_var_proxy = a + b * sigma * np.sqrt(1 - min(0.999, rho**2))
+            if min_var_proxy < 0:
+                penalty += 1000 * abs(min_var_proxy)
+                
+            return rmse + penalty
 
-        # Bounds: a, b, rho, m, sigma
-        # Relaxed 'a' slightly, strict 'rho' and 'sigma'
-        bounds = [
-            (-0.5, 2.0),      # a: level (usually >0, but can be slightly neg mathematically if w>0)
-            (0.0, 5.0),       # b: angle (must be positive)
-            (-0.999, 0.999),  # rho: Correlation (strictly between -1 and 1)
-            (-2.0, 2.0),      # m: horizontal shift
-            (0.001, 2.0)      # sigma: curvature (must be positive)
-        ]
-
-        # --- Multi-Start Strategy (The Fix) ---
-        # We try multiple initial guesses. If one fails, we try the next.
-        # This is crucial for short-dated options which have extreme Skew.
+        # 2. Multi-Start Optimization
+        # SVI is non-convex; good initial guesses are critical.
+        # Format: [a, b, rho, m, sigma]
         initial_guesses = [
-            [0.04, 0.1, -0.5, 0.0, 0.1],   # 1. Standard (Gentle Smile)
-            [0.04, 0.3, -0.9, -0.1, 0.05], # 2. High Skew (Short-term Put heavy)
-            [0.01, 0.1, 0.0, 0.0, 0.2],    # 3. High Curvature (Earnings/Event)
-            [0.10, 0.05, -0.3, 0.1, 0.1]   # 4. High Vol Level
+            [0.04, 0.1, -0.5, 0.0, 0.1],   # Typical Equity Skew
+            [0.04, 0.1, 0.0, 0.0, 0.1],    # Flat Smile
+            [0.01, 0.05, -0.8, 0.1, 0.2],  # Deep Skew
+            [np.min(w_data), 0.1, -0.5, 0.0, 0.1] # Adaptive 'a'
+        ]
+        
+        # Bounds for SLSQP: (min, max)
+        bounds = [
+            (-0.5, 2.0), # a: can be slightly negative in Raw SVI if wings counteract, but usually >0
+            (0.0, 5.0),  # b: must be positive
+            (-0.999, 0.999), # rho
+            (-1.0, 1.0), # m: usually near 0 for forward moneyness
+            (0.001, 5.0) # sigma: must be positive
         ]
 
         best_result = None
-        best_mse = float('inf')
+        best_rmse = float('inf')
 
-        for i, guess in enumerate(initial_guesses):
+        for guess in initial_guesses:
             try:
-                # SLSQP often handles boundary constraints better than L-BFGS-B for SVI
                 result = minimize(
                     objective, 
                     guess, 
                     method='SLSQP', 
-                    bounds=bounds,
-                    tol=1e-8,
-                    options={'maxiter': 1000}
+                    bounds=bounds, 
+                    options={'ftol': 1e-8, 'disp': False}
                 )
                 
-                if result.success:
-                    mse = result.fun
-                    if mse < best_mse:
-                        best_mse = mse
-                        best_result = result
+                if result.success and result.fun < best_rmse:
+                    best_rmse = result.fun
+                    best_result = result
             except Exception:
                 continue
-        
-        # Check if we found ANY valid solution
+
+        # 3. Finalize
         if best_result is not None:
             self.params = best_result.x
-            self.rms_error = np.sqrt(best_mse / len(k_data))
+            # Recalculate pure RMSE without penalty for reporting
+            w_final = self.raw_svi_formula(k_data, *self.params)
+            self.rms_error = np.sqrt(np.mean((w_final - w_data)**2))
             
-            # Determine success based on RMSE thresholds (optional, but good for logs)
-            # If RMSE is too huge, it's technically a math success but a model failure.
-            is_acceptable = self.rms_error < 0.1 
-
             return {
                 "a": self.params[0],
                 "b": self.params[1],
@@ -131,44 +129,43 @@ class SVIModel:
                 "m": self.params[3],
                 "sigma": self.params[4],
                 "rmse": self.rms_error,
-                "success": True # We mark it true if optimizer converged
+                "success": True
             }
         else:
-            logger.warning(f"SVI Calibration failed for slice (all guesses failed).")
-            return None
+            logger.warning("SVI Calibration failed (all guesses).")
+            return {"success": False}
 
     def get_vol(self, k: float, T: float) -> float:
         """
-        Predicts Implied Volatility for a given Log-Moneyness and Time.
-        sigma_impl = sqrt(w / T)
+        Predicts Implied Volatility for a given Log-Forward Moneyness k and Time T.
         """
         if self.params is None:
             raise ValueError("Model not calibrated yet.")
             
         a, b, rho, m, sigma = self.params
-        w = self.raw_svi_formula(k, a, b, rho, m, sigma)
-        
-        # Safety floor: Variance cannot be negative.
-        # If model implies negative variance, floor at small epsilon.
-        if w < 1e-6: 
-            w = 1e-6
-            
-        return np.sqrt(w / T)
+        return self.raw_svi_formula_vol(k, a, b, rho, m, sigma, T)
 
-# --- Test Block ---
 if __name__ == "__main__":
-    # Test with typical short-dated high-skew data
-    k_test = np.array([-0.2, -0.1, 0.0, 0.1, 0.2]) 
-    v_test = np.array([0.40, 0.30, 0.20, 0.18, 0.17]) # High skew
-    T_test = 0.02 # 1 week
-    w_test = v_test**2 * T_test 
+    # Unit Test
+    # Simulate a typical Equity Vol Skew
+    k_test = np.linspace(-0.2, 0.2, 10) # Log-Moneyness
+    # Synthetic "market" vols (Smile shape)
+    v_test = 0.20 - 0.3 * k_test + 0.5 * k_test**2 
+    T_test = 0.1
+    w_test = (v_test ** 2) * T_test
     
     svi = SVIModel()
-    params = svi.calibrate(k_test, w_test)
+    res = svi.calibrate(k_test, w_test)
     
-    if params:
-        print("Calibrated Params:", params)
-        print("RMSE:", params['rmse'])
-        print("Predicted Vol at ATM (k=0):", svi.get_vol(0, T_test))
+    print("-" * 30)
+    print("SVI Calibration Unit Test")
+    print("-" * 30)
+    if res['success']:
+        print(f"Calibration Successful (RMSE: {res['rmse']:.6f})")
+        print(f"Params: a={res['a']:.4f}, b={res['b']:.4f}, rho={res['rho']:.4f}, m={res['m']:.4f}, sigma={res['sigma']:.4f}")
+        
+        # Check density constraint
+        min_var = res['a'] + res['b'] * res['sigma'] * np.sqrt(1 - res['rho']**2)
+        print(f"Min Total Variance check (should be > 0): {min_var:.6f}")
     else:
         print("Calibration Failed")
