@@ -36,6 +36,7 @@ class SVIModel:
         """
         Calibrates the SVI model to market data for a single slice (single expiry).
         Uses Multi-Start Optimization to handle local minima in short-dated options.
+        Includes Regularization to prevent Local Volatility instability.
         
         Args:
             k_data: Array of log-moneyness log(K/S)
@@ -44,7 +45,7 @@ class SVIModel:
         Returns:
             Dict containing calibrated parameters and optimization status.
         """
-        # Objective function: Minimize Sum of Squared Errors (SSE)
+        # Objective function: Minimize Sum of Squared Errors (SSE) + Penalties
         def objective(params):
             a, b, rho, m, sigma = params
             w_model = self.raw_svi_formula(k_data, a, b, rho, m, sigma)
@@ -52,8 +53,24 @@ class SVIModel:
             # Penalty for NaN or negative variance (impossible in reality)
             if np.any(np.isnan(w_model)) or np.any(w_model < 0):
                 return 1e9
-                
-            return np.sum((w_model - w_data)**2)
+            
+            # Base Error (MSE)
+            mse = np.sum((w_model - w_data)**2)
+
+            # --- NEW: Regularization (Penalty) ---
+            # Penalize extreme curvature (sigma) and extreme skew (rho)
+            # to prevent Local Volatility explosions (numerical instability).
+            penalty = 0.0
+            
+            # Penalize sigma > 1.0 (High curvature causes 2nd derivative spikes in Dupire)
+            if sigma > 1.0: 
+                penalty += (sigma - 1.0) * 10.0 
+            
+            # Penalize rho > 0.95 or < -0.95 (Extreme skew leads to arbitrage violations)
+            if abs(rho) > 0.95: 
+                penalty += (abs(rho) - 0.95) * 10.0
+            
+            return mse + penalty
 
         # Bounds: a, b, rho, m, sigma
         # Relaxed 'a' slightly, strict 'rho' and 'sigma'
